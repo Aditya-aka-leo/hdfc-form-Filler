@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Journey Recorder</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f0f10;
+      --surface: #18181b;
+      --surface-2: #222226;
+      --border: rgba(255,255,255,0.08);
+      --border-hover: rgba(255,255,255,0.14);
+      --text: #f0f0f2;
+      --text-2: #8b8b99;
+      --text-3: #55555f;
+      --accent: #7c6af7;
+      --accent-dim: rgba(124,106,247,0.15);
+      --green: #22c55e;
+      --green-dim: rgba(34,197,94,0.12);
+      --red: #ef4444;
+      --red-dim: rgba(239,68,68,0.12);
+      --orange: #f97316;
+      --orange-dim: rgba(249,115,22,0.12);
+      --radius: 10px;
+      --radius-sm: 7px;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 13px;
+      width: 340px;
+      background: var(--bg);
+      color: var(--text);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Header ── */
+    header {
+      padding: 14px 16px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .logo {
+      width: 26px;
+      height: 26px;
+      border-radius: 7px;
+      background: linear-gradient(135deg, #7c6af7 0%, #a78bfa 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .logo svg { width: 14px; height: 14px; color: #fff; }
+
+    .header-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: -0.2px;
+    }
+
+    .header-sub {
+      font-size: 11px;
+      color: var(--text-2);
+      margin-top: 1px;
+    }
+
+    .rec-badge {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 8px;
+      border-radius: 20px;
+      background: var(--green-dim);
+      border: 1px solid rgba(34,197,94,0.2);
+      font-size: 10px;
+      font-weight: 500;
+      color: var(--green);
+      letter-spacing: 0.3px;
+    }
+
+    .rec-badge.replay-mode {
+      background: var(--orange-dim);
+      border-color: rgba(249,115,22,0.2);
+      color: var(--orange);
+    }
+
+    .rec-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    /* ── Body ── */
+    .body { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+
+    /* ── Save card ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .card-header {
+      padding: 10px 12px 8px;
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--text-3);
+    }
+
+    .save-row {
+      display: flex;
+      gap: 6px;
+      padding: 0 10px 10px;
+    }
+
+    .input-wrap {
+      flex: 1;
+      position: relative;
+    }
+
+    .input-wrap input {
+      width: 100%;
+      padding: 7px 10px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-family: inherit;
+      font-size: 12px;
+      color: var(--text);
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    .input-wrap input::placeholder { color: var(--text-3); }
+    .input-wrap input:focus { border-color: var(--accent); }
+
+    /* ── Buttons ── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      padding: 7px 13px;
+      border-radius: var(--radius-sm);
+      border: none;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 500;
+      transition: all 0.15s;
+      white-space: nowrap;
+    }
+
+    .btn svg { width: 12px; height: 12px; flex-shrink: 0; }
+
+    .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+    .btn-accent {
+      background: var(--accent);
+      color: #fff;
+    }
+    .btn-accent:not(:disabled):hover { background: #6b5ce0; }
+
+    .btn-ghost {
+      background: var(--surface-2);
+      color: var(--text-2);
+      border: 1px solid var(--border);
+    }
+    .btn-ghost:not(:disabled):hover {
+      background: var(--surface);
+      color: var(--text);
+      border-color: var(--border-hover);
+    }
+
+    .btn-danger-ghost {
+      background: transparent;
+      color: var(--red);
+      border: 1px solid transparent;
+    }
+    .btn-danger-ghost:not(:disabled):hover {
+      background: var(--red-dim);
+      border-color: rgba(239,68,68,0.2);
+    }
+
+    .btn-sm { padding: 5px 10px; font-size: 11px; }
+    .btn-icon { width: 30px; height: 30px; padding: 0; }
+
+    /* ── Active replay banner ── */
+    .replay-banner {
+      display: none;
+      background: var(--orange-dim);
+      border: 1px solid rgba(249,115,22,0.2);
+      border-radius: var(--radius);
+      padding: 9px 12px;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .replay-banner.visible { display: flex; }
+
+    .replay-banner-info {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+    }
+
+    .replay-banner-info svg {
+      width: 14px;
+      height: 14px;
+      color: var(--orange);
+      flex-shrink: 0;
+    }
+
+    .replay-banner-text { min-width: 0; }
+
+    .replay-banner-title {
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--orange);
+    }
+
+    .replay-banner-label {
+      font-size: 10px;
+      color: var(--text-2);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* ── Journey list ── */
+    #journeyList { padding: 0 0 4px; }
+
+    .empty-state {
+      padding: 24px 16px;
+      text-align: center;
+      color: var(--text-3);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
+    .empty-icon {
+      font-size: 24px;
+      margin-bottom: 6px;
+      opacity: 0.5;
+    }
+
+    .journey-item {
+      display: flex;
+      align-items: center;
+      padding: 10px 12px;
+      gap: 10px;
+      border-bottom: 1px solid var(--border);
+      transition: background 0.1s;
+    }
+
+    .journey-item:last-child { border-bottom: none; }
+    .journey-item:hover { background: var(--surface-2); }
+
+    .journey-icon {
+      width: 28px;
+      height: 28px;
+      border-radius: 7px;
+      background: var(--accent-dim);
+      border: 1px solid rgba(124,106,247,0.2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .journey-icon svg { width: 13px; height: 13px; color: var(--accent); }
+
+    .journey-info { flex: 1; min-width: 0; }
+
+    .journey-label {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .journey-meta {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 2px;
+    }
+
+    .journey-sub-actions {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      margin-top: 7px;
+    }
+
+    .journey-date {
+      font-size: 10px;
+      color: var(--text-3);
+    }
+
+    .field-pill {
+      font-size: 9px;
+      font-weight: 600;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--text-2);
+      letter-spacing: 0.2px;
+    }
+
+    .btn-play {
+      width: 42px;
+      height: 42px;
+      padding: 0;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: background 0.15s, transform 0.1s;
+      flex-shrink: 0;
+    }
+    .btn-play svg { width: 17px; height: 17px; }
+    .btn-play:not(:disabled):hover { background: #6b5ce0; transform: scale(1.07); }
+    .btn-play:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+
+    /* ── Status bar ── */
+    #statusBar {
+      padding: 0 12px 10px;
+      font-size: 11px;
+      color: var(--text-2);
+      text-align: center;
+      min-height: 22px;
+      transition: color 0.2s;
+    }
+
+    #statusBar.error { color: var(--red); }
+    #statusBar.success { color: var(--green); }
+
+    /* ── Field panel ── */
+    .field-panel {
+      border-top: 1px solid var(--border);
+      background: var(--bg);
+    }
+
+    .field-panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px 6px;
+    }
+
+    .field-panel-title {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--text-3);
+    }
+
+    .field-panel-count {
+      font-size: 10px;
+      color: var(--text-2);
+    }
+
+    .field-panel-list {
+      max-height: 210px;
+      overflow-y: auto;
+      padding-bottom: 6px;
+    }
+
+    .field-panel-list::-webkit-scrollbar { width: 3px; }
+    .field-panel-list::-webkit-scrollbar-track { background: transparent; }
+    .field-panel-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .field-row {
+      display: flex;
+      align-items: center;
+      padding: 5px 12px;
+      gap: 10px;
+      transition: opacity 0.15s;
+    }
+
+    .field-row-disabled { opacity: 0.35; }
+
+    .field-row-info { flex: 1; min-width: 0; }
+
+    .field-row-name {
+      display: block;
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .field-row-value {
+      display: block;
+      font-size: 10px;
+      color: var(--text-3);
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-top: 1px;
+    }
+
+    /* ── Toggle switch ── */
+    .toggle { position: relative; flex-shrink: 0; cursor: pointer; }
+    .toggle input { display: none; }
+
+    .toggle-track {
+      display: block;
+      width: 28px;
+      height: 16px;
+      border-radius: 8px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      position: relative;
+      transition: background 0.2s, border-color 0.2s;
+    }
+
+    .toggle-thumb {
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--text-3);
+      transition: transform 0.2s, background 0.2s;
+    }
+
+    .toggle input:checked + .toggle-track {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+
+    .toggle input:checked + .toggle-track .toggle-thumb {
+      transform: translateX(12px);
+      background: #fff;
+    }
+
+    /* copy sheet section divider */
+    .copy-section-label {
+      padding: 6px 14px 3px;
+      font-size: 9px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--text-3);
+    }
+
+    /* ── Active button state ── */
+    .btn-active {
+      background: var(--accent-dim) !important;
+      color: var(--accent) !important;
+      border-color: rgba(124,106,247,0.25) !important;
+    }
+
+    /* ── Bottom sheet overlay ── */
+    .sheet-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+      z-index: 50;
+      backdrop-filter: blur(2px);
+    }
+    .sheet-overlay.open { display: block; }
+
+    /* ── Copy sheet ── */
+    .copy-sheet {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      border-radius: 14px 14px 0 0;
+      display: flex;
+      flex-direction: column;
+      max-height: 78%;
+      z-index: 100;
+      transform: translateY(100%);
+      transition: transform 0.24s cubic-bezier(0.32, 0.72, 0, 1);
+    }
+    .copy-sheet.open { transform: translateY(0); }
+
+    .sheet-drag {
+      width: 32px;
+      height: 4px;
+      border-radius: 2px;
+      background: var(--border-hover);
+      margin: 10px auto 0;
+      flex-shrink: 0;
+    }
+
+    .copy-sheet-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      padding: 10px 14px 8px;
+      flex-shrink: 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .copy-sheet-titles { min-width: 0; }
+
+    .copy-sheet-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .copy-sheet-sub {
+      font-size: 10px;
+      color: var(--text-3);
+      margin-top: 2px;
+    }
+
+    .copy-sheet-close {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: var(--text-3);
+      padding: 2px;
+      display: flex;
+      align-items: center;
+      border-radius: 5px;
+      flex-shrink: 0;
+    }
+    .copy-sheet-close:hover { color: var(--text); background: var(--surface-2); }
+    .copy-sheet-close svg { width: 14px; height: 14px; }
+
+    /* ── Field list inside sheet ── */
+    .copy-field-list {
+      overflow-y: auto;
+      flex: 1;
+      padding: 4px 0;
+    }
+
+    .copy-field-list::-webkit-scrollbar { width: 3px; }
+    .copy-field-list::-webkit-scrollbar-track { background: transparent; }
+    .copy-field-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .copy-field-row {
+      display: flex;
+      align-items: center;
+      padding: 7px 14px;
+      gap: 10px;
+      cursor: pointer;
+      transition: background 0.1s;
+    }
+    .copy-field-row:hover { background: var(--surface-2); }
+
+    .copy-field-row input[type="checkbox"] { display: none; }
+
+    .copy-check {
+      width: 15px;
+      height: 15px;
+      border-radius: 4px;
+      border: 1.5px solid var(--border-hover);
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.15s;
+      background: transparent;
+    }
+
+    .copy-field-row input:checked ~ .copy-check {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+
+    .copy-check svg { width: 9px; height: 9px; color: #fff; opacity: 0; transition: opacity 0.15s; }
+    .copy-field-row input:checked ~ .copy-check svg { opacity: 1; }
+
+    .copy-field-info { flex: 1; min-width: 0; }
+
+    .copy-field-name {
+      display: block;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .copy-field-value {
+      display: block;
+      font-size: 10px;
+      color: var(--text-3);
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-top: 2px;
+    }
+
+    /* ── Sheet footer ── */
+    .copy-sheet-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px 14px;
+      border-top: 1px solid var(--border);
+      flex-shrink: 0;
+      gap: 8px;
+    }
+
+    .copy-footer-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    #copyCount {
+      font-size: 11px;
+      color: var(--text-2);
+    }
+
+    .link-btn {
+      background: none;
+      border: none;
+      cursor: pointer;
+      font-size: 11px;
+      font-family: inherit;
+      color: var(--accent);
+      padding: 0;
+    }
+    .link-btn:hover { opacity: 0.75; }
+  </style>
+</head>
+<body>
+
+<!-- Header -->
+<header>
+  <div class="header-left">
+    <div class="logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
+      </svg>
+    </div>
+    <div>
+      <div class="header-title">Journey Recorder</div>
+    </div>
+  </div>
+  <div class="rec-badge" id="statusDot">
+    <span class="rec-dot"></span>
+    <span id="statusLabel">REC</span>
+  </div>
+</header>
+
+<!-- Body -->
+<div class="body">
+
+  <!-- Active replay banner -->
+  <div id="activeReplayBar" class="replay-banner">
+    <div class="replay-banner-info">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="5 3 19 12 5 21 5 3"/>
+      </svg>
+      <div class="replay-banner-text">
+        <div class="replay-banner-title">Replay active</div>
+        <div class="replay-banner-label" id="activeReplayLabel"></div>
+      </div>
+    </div>
+    <button class="btn btn-ghost btn-sm" id="btnStopReplay">Stop</button>
+  </div>
+
+  <!-- Save section -->
+  <div class="card">
+    <div class="card-header">Save journey</div>
+    <div class="save-row">
+      <div class="input-wrap">
+        <input type="text" id="journeyName" placeholder="e.g. Self Employed – Test" maxlength="60" />
+      </div>
+      <button class="btn btn-accent" id="btnSave">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/>
+          <polyline points="17 21 17 13 7 13 7 21"/>
+          <polyline points="7 3 7 8 15 8"/>
+        </svg>
+        Save
+      </button>
+    </div>
+  </div>
+
+  <!-- Journey list -->
+  <div class="card">
+    <div class="card-header">Saved journeys</div>
+    <div id="journeyList">
+      <div class="empty-state">
+        <div class="empty-icon">🗂</div>
+        <div>No journeys saved yet.<br/>Fill a form and hit Save.</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="statusBar"></div>
+
+</div>
+
+<!-- Sheet overlay -->
+<div class="sheet-overlay" id="sheetOverlay"></div>
+
+<!-- Copy fields bottom sheet -->
+<div class="copy-sheet" id="copySheet">
+  <div class="sheet-drag"></div>
+  <div class="copy-sheet-header">
+    <div class="copy-sheet-titles">
+      <div class="copy-sheet-title" id="copySheetTitle">Fields</div>
+      <div class="copy-sheet-sub">Select fields to copy</div>
+    </div>
+    <button class="copy-sheet-close" id="btnCloseSheet">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
+  </div>
+
+  <div class="copy-field-list" id="copyFieldList"></div>
+
+  <div class="copy-sheet-footer">
+    <div class="copy-footer-left">
+      <span id="copyCount"></span>
+      <button class="link-btn" id="btnSelectAll">Select all</button>
+    </div>
+    <button class="btn btn-accent" id="btnCopyJSON">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="9" y="2" width="6" height="4" rx="1"/>
+        <path d="M8 4H6a2 2 0 00-2 2v14a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-2"/>
+        <line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="15" y2="16"/>
+      </svg>
+      Copy JSON
+    </button>
+  </div>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>
