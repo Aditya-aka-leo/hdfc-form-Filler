@@ -95,15 +95,33 @@ async function apiFetch(path, options = {}) {
 }
 
 async function loadSessions(pathname) {
+  // Always load locally saved (offline) sessions first
+  const allLocal = await chrome.storage.local.get(null);
+  const localSessions = Object.entries(allLocal)
+    .filter(([k]) => k.startsWith('local_'))
+    .map(([, v]) => v)
+    .filter(s => s.pathname === pathname)
+    .map(s => ({ ...s, _local: true }));
+
   try {
     const { sessions } = await apiFetch(`/sessions?pathname=${encodeURIComponent(pathname)}`);
-    // Attach locally stored steps to each session
     const keys = sessions.map(s => `steps_${s.id}`);
     const stored = keys.length ? await chrome.storage.local.get(keys) : {};
-    return sessions.map(s => ({ ...s, steps: stored[`steps_${s.id}`] || [] }));
-  } catch (err) {
-    setStatus(`Could not reach server: ${err.message}`, 'error');
-    return [];
+    const apiSessions = sessions.map(s => ({
+      ...s,
+      steps: (s.steps && s.steps.length) ? s.steps : (stored[`steps_${s.id}`] || []),
+    }));
+    // Include local sessions that haven't been synced yet (not already in API response)
+    const apiIds = new Set(apiSessions.map(s => s.id));
+    const unsynced = localSessions.filter(s => !apiIds.has(s.id));
+    return [...apiSessions, ...unsynced];
+  } catch {
+    if (localSessions.length) {
+      setStatus('Server offline — showing local saves.', 'default');
+    } else {
+      setStatus('Could not reach server.', 'error');
+    }
+    return localSessions;
   }
 }
 
@@ -290,13 +308,14 @@ function renderList(sessions, pathname, deviceId) {
     const isActive = activeReplayId === session.id;
     const isPanelOpen = openPanelId === session.id;
     const isOwn = session.createdBy === deviceId;
+    const isLocal = !!session._local;
 
     const item = document.createElement('div');
     item.className = 'journey-item';
 
-    const creatorTag = !isOwn
-      ? `<span class="creator-pill">${session.displayName || displayCreator(session.createdBy)}</span>`
-      : '';
+    const creatorTag = isLocal
+      ? `<span class="creator-pill" style="background:var(--orange-dim);color:var(--orange)">local</span>`
+      : (!isOwn ? `<span class="creator-pill">${session.displayName || displayCreator(session.createdBy)}</span>` : '');
 
     item.innerHTML = `
       <div class="journey-icon">
@@ -343,6 +362,16 @@ function renderList(sessions, pathname, deviceId) {
         item.insertAdjacentElement('afterend', panel);
       }
     });
+
+    // Share button — only for local (offline) saves
+    if (isLocal) {
+      const btnShare = document.createElement('button');
+      btnShare.className = 'btn btn-accent btn-sm';
+      btnShare.title = 'Upload to server so teammates can use it';
+      btnShare.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="width:11px;height:11px"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0018 9h-1.26A8 8 0 103 16.3"/></svg> Share`;
+      btnShare.addEventListener('click', () => shareSession(session, pathname, deviceId));
+      actions.appendChild(btnShare);
+    }
 
     // Replay Journey button (step replay) — only shown when steps are recorded
     if (session.steps && session.steps.length > 0) {
@@ -429,11 +458,13 @@ async function saveJourney(pathname, deviceId) {
     displayName: displayName || null,
   };
 
+  let steps = [];
+  const shareSteps = document.getElementById('shareStepsToggle')?.checked;
   try {
     const stepsResponse = await chrome.tabs.sendMessage(tab.id, { type: 'GET_STEPS' });
-    const steps = stepsResponse.steps || [];
-    if (steps.length) {
-      await chrome.storage.local.set({ [`steps_${session.id}`]: steps });
+    steps = stepsResponse.steps || [];
+    if (steps.length && shareSteps) {
+      session.steps = steps; // include in POST body so teammates get them
     }
   } catch { /* ignore */ }
 
@@ -442,12 +473,22 @@ async function saveJourney(pathname, deviceId) {
       method: 'POST',
       body: JSON.stringify(session),
     });
+    // API succeeded — store steps locally if not shared via API
+    if (steps.length && !shareSteps) {
+      await chrome.storage.local.set({ [`steps_${session.id}`]: steps });
+    }
     nameInput.value = '';
     setStatus(`Saved "${label}" — ${Object.keys(current).length} fields.`, 'success');
     const sessions = await loadSessions(pathname);
     renderList(sessions, pathname, deviceId);
-  } catch (err) {
-    setStatus(`Save failed: ${err.message}`, 'error');
+  } catch {
+    // Server offline — save everything locally so no work is lost
+    const localSession = { ...session, steps, _local: true };
+    await chrome.storage.local.set({ [`local_${session.id}`]: localSession });
+    nameInput.value = '';
+    setStatus(`Server offline — "${label}" saved locally. Share it later.`, 'default');
+    const sessions = await loadSessions(pathname);
+    renderList(sessions, pathname, deviceId);
   }
 }
 
@@ -492,7 +533,33 @@ async function stopReplay(pathname, deviceId) {
   renderList(sessions, pathname, deviceId);
 }
 
+async function shareSession(session, pathname, deviceId) {
+  try {
+    const sessionToShare = { ...session };
+    delete sessionToShare._local;
+    await apiFetch('/sessions', { method: 'POST', body: JSON.stringify(sessionToShare) });
+    // Uploaded — remove local copy
+    await chrome.storage.local.remove(`local_${session.id}`);
+    setStatus(`"${session.label}" shared with team.`, 'success');
+    const sessions = await loadSessions(pathname);
+    renderList(sessions, pathname, deviceId);
+  } catch (err) {
+    setStatus(`Share failed: ${err.message}`, 'error');
+  }
+}
+
 async function deleteSession(id, pathname, deviceId) {
+  // Local-only session — just remove from chrome.storage.local
+  const localKey = `local_${id}`;
+  const stored = await chrome.storage.local.get(localKey);
+  if (stored[localKey]) {
+    await chrome.storage.local.remove(localKey);
+    setStatus('Journey deleted.', 'default');
+    const sessions = await loadSessions(pathname);
+    renderList(sessions, pathname, deviceId);
+    return;
+  }
+
   try {
     await apiFetch(`/sessions/${id}`, { method: 'DELETE' });
   } catch (err) {
@@ -526,6 +593,16 @@ async function init() {
   if (userNameInput && savedName) userNameInput.value = savedName;
   if (userNameInput) {
     userNameInput.addEventListener('blur', () => saveUserName(userNameInput.value.trim()));
+  }
+
+  // Restore share-steps toggle preference
+  const shareStepsToggle = document.getElementById('shareStepsToggle');
+  if (shareStepsToggle) {
+    const { shareSteps } = await chrome.storage.local.get('shareSteps');
+    shareStepsToggle.checked = !!shareSteps;
+    shareStepsToggle.addEventListener('change', () => {
+      chrome.storage.local.set({ shareSteps: shareStepsToggle.checked });
+    });
   }
 
   const sessions = await loadSessions(pathname);
