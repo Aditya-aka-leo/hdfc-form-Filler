@@ -4,8 +4,44 @@ let replayData = null;
 let replayObserver = null;
 let fillInProgress = false;
 let pendingFill = false;
+let activeRequests = 0;
 
-const FILL_DELAY_MS = 150; // ms to wait after each field change for the rule engine to settle
+// ─── Network Intercept ───────────────────────────────────────────────────────
+
+(function interceptNetwork() {
+  // Intercept fetch
+  const originalFetch = window.fetch;
+  window.fetch = function (...args) {
+    activeRequests++;
+    return originalFetch.apply(this, args).finally(() => {
+      activeRequests = Math.max(0, activeRequests - 1);
+    });
+  };
+
+  // Intercept XHR
+  const originalSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function (...args) {
+    activeRequests++;
+    this.addEventListener('loadend', () => {
+      activeRequests = Math.max(0, activeRequests - 1);
+    });
+    return originalSend.apply(this, args);
+  };
+})();
+
+/** Resolves once there are no in-flight fetch/XHR requests */
+function waitForNetwork() {
+  return new Promise(resolve => {
+    if (activeRequests === 0) return resolve();
+    const id = setInterval(() => {
+      if (activeRequests === 0) {
+        clearInterval(id);
+        resolve();
+      }
+    }, 20);
+  });
+}
+
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -94,25 +130,20 @@ async function prefillVisibleFields() {
       const value = replayData[name];
       const type = input.type.toLowerCase();
 
-      let changed = false;
       if (type === 'radio' || type === 'checkbox') {
         if (input.checked !== Boolean(value)) {
           input.checked = Boolean(value);
           dispatchEvents(input);
-          changed = true;
+          await waitForNetwork();
         }
       } else {
         if (input.value !== String(value)) {
           input.value = String(value);
           dispatchEvents(input);
-          changed = true;
+          await waitForNetwork();
         }
       }
 
-      // Only wait when we actually changed something — let the rule engine react
-      if (changed) {
-        await new Promise(resolve => setTimeout(resolve, FILL_DELAY_MS));
-      }
     }
   } finally {
     fillInProgress = false;
@@ -143,8 +174,7 @@ function startReplayObserver() {
       }
     }
     if (shouldPrefill) {
-      // Small delay to let the rule engine render the newly visible fields
-      setTimeout(prefillVisibleFields, 50);
+      prefillVisibleFields();
     }
   });
 
