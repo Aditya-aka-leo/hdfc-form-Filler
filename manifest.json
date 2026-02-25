@@ -3,9 +3,13 @@
   "name": "Journey Recorder",
   "version": "1.0.0",
   "description": "Record and replay HDFC EDS form journeys",
+  "background": {
+    "service_worker": "background.js"
+  },
   "permissions": [
     "storage",
-    "activeTab"
+    "activeTab",
+    "tabs"
   ],
   "host_permissions": [
     "https://*/*",
@@ -14,7 +18,7 @@
   "content_scripts": [
     {
       "matches": ["https://*/*", "http://*/*"],
-      "js": ["content.js"],
+      "js": ["skip-config.js", "content.js"],
       "run_at": "document_idle"
     }
   ],

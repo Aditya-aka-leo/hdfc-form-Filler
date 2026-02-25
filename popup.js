@@ -97,7 +97,10 @@ async function apiFetch(path, options = {}) {
 async function loadSessions(pathname) {
   try {
     const { sessions } = await apiFetch(`/sessions?pathname=${encodeURIComponent(pathname)}`);
-    return sessions;
+    // Attach locally stored steps to each session
+    const keys = sessions.map(s => `steps_${s.id}`);
+    const stored = keys.length ? await chrome.storage.local.get(keys) : {};
+    return sessions.map(s => ({ ...s, steps: stored[`steps_${s.id}`] || [] }));
   } catch (err) {
     setStatus(`Could not reach server: ${err.message}`, 'error');
     return [];
@@ -307,6 +310,7 @@ function renderList(sessions, pathname, deviceId) {
         <div class="journey-meta">
           <span class="journey-date">${fmt(session.savedAt)}</span>
           <span class="field-pill">${Object.keys(session.data).length} fields</span>
+          ${session.steps && session.steps.length ? `<span class="field-pill" title="Has step recording">${session.steps.length} steps</span>` : ''}
           ${creatorTag}
         </div>
         <div class="journey-sub-actions"></div>
@@ -340,15 +344,25 @@ function renderList(sessions, pathname, deviceId) {
       }
     });
 
-    // Replay button
-    const btnReplay = document.createElement('button');
-    btnReplay.className = 'btn-play';
-    btnReplay.title = isActive ? 'Active' : 'Replay';
-    btnReplay.innerHTML = isActive
-      ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>`
-      : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor" stroke="none"/></svg>`;
-    btnReplay.disabled = isActive;
-    btnReplay.addEventListener('click', () => startReplay(session, pathname, deviceId));
+    // Replay Journey button (step replay) — only shown when steps are recorded
+    if (session.steps && session.steps.length > 0) {
+      const btnReplay = document.createElement('button');
+      btnReplay.className = 'btn btn-accent btn-sm';
+      btnReplay.title = 'Replay full journey (step-by-step)';
+      btnReplay.disabled = isActive;
+      btnReplay.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="width:11px;height:11px"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor" stroke="none"/></svg> Replay`;
+      btnReplay.addEventListener('click', () => startReplay(session, pathname, deviceId, 'steps'));
+      actions.appendChild(btnReplay);
+    }
+
+    // Prefill Data button — always available
+    const btnPrefill = document.createElement('button');
+    btnPrefill.className = 'btn btn-ghost btn-sm';
+    btnPrefill.title = 'Prefill form fields only';
+    btnPrefill.disabled = isActive;
+    btnPrefill.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="width:11px;height:11px"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg> Prefill`;
+    btnPrefill.addEventListener('click', () => startReplay(session, pathname, deviceId, 'prefill'));
+    actions.appendChild(btnPrefill);
 
     // Delete — only for sessions you own
     if (isOwn) {
@@ -361,7 +375,6 @@ function renderList(sessions, pathname, deviceId) {
     }
 
     actions.appendChild(btnConfigure);
-    item.appendChild(btnReplay);
     list.appendChild(item);
 
     if (isPanelOpen) {
@@ -417,6 +430,14 @@ async function saveJourney(pathname, deviceId) {
   };
 
   try {
+    const stepsResponse = await chrome.tabs.sendMessage(tab.id, { type: 'GET_STEPS' });
+    const steps = stepsResponse.steps || [];
+    if (steps.length) {
+      await chrome.storage.local.set({ [`steps_${session.id}`]: steps });
+    }
+  } catch { /* ignore */ }
+
+  try {
     await apiFetch('/sessions', {
       method: 'POST',
       body: JSON.stringify(session),
@@ -430,21 +451,26 @@ async function saveJourney(pathname, deviceId) {
   }
 }
 
-async function startReplay(session, pathname, deviceId) {
-  const excluded = new Set(session.excluded || []);
-  const filteredData = Object.fromEntries(
-    Object.entries(session.data).filter(([key]) => !excluded.has(key))
-  );
-
+async function startReplay(session, pathname, deviceId, mode = 'prefill') {
   const tab = await getTab();
   try {
-    await chrome.tabs.sendMessage(tab.id, { type: 'START_REPLAY', data: filteredData });
-    setActiveReplay(session);
-    const skipped = excluded.size;
-    const msg = skipped > 0
-      ? `Replay started — ${skipped} field${skipped > 1 ? 's' : ''} skipped.`
-      : `Replay started for "${session.label}".`;
-    setStatus(msg, 'success');
+    if (mode === 'steps' && session.steps && session.steps.length > 0) {
+      await chrome.tabs.sendMessage(tab.id, { type: 'START_STEP_REPLAY', steps: session.steps });
+      setActiveReplay(session);
+      setStatus(`Replay started — ${session.steps.length} steps.`, 'success');
+    } else {
+      const excluded = new Set(session.excluded || []);
+      const filteredData = Object.fromEntries(
+        Object.entries(session.data).filter(([key]) => !excluded.has(key))
+      );
+      await chrome.tabs.sendMessage(tab.id, { type: 'START_REPLAY', data: filteredData });
+      setActiveReplay(session);
+      const skipped = excluded.size;
+      const msg = skipped > 0
+        ? `Prefill started — ${skipped} field${skipped > 1 ? 's' : ''} skipped.`
+        : `Prefill started for "${session.label}".`;
+      setStatus(msg, 'success');
+    }
     const sessions = await loadSessions(pathname);
     renderList(sessions, pathname, deviceId);
   } catch {
@@ -456,6 +482,7 @@ async function stopReplay(pathname, deviceId) {
   const tab = await getTab();
   try {
     await chrome.tabs.sendMessage(tab.id, { type: 'STOP_REPLAY' });
+    await chrome.tabs.sendMessage(tab.id, { type: 'STOP_STEP_REPLAY' });
   } catch {
     // ignore — tab may have navigated
   }
@@ -472,6 +499,7 @@ async function deleteSession(id, pathname, deviceId) {
     setStatus(`Delete failed: ${err.message}`, 'error');
     return;
   }
+  chrome.storage.local.remove(`steps_${id}`);
 
   if (openPanelId === id) openPanelId = null;
 
