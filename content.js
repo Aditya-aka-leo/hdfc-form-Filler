@@ -8,6 +8,9 @@ let pendingFill = false;
 let activeRequests = 0;
 let stepReplayActive = false;
 let lastApiError = false;
+let isReplayFilling = false;          // true only while dispatchEvents() is running
+const userModifiedDuringReplay = new Set(); // field names the user manually touched during replay
+const replayTargetValues = new Map(); // fieldName → value the replay last set
 
 // ─── Logger ───────────────────────────────────────────────────────────────────
 
@@ -104,8 +107,31 @@ function shouldSkipClick(el) {
 
 /** Dispatch input + change so the rule engine re-evaluates */
 function dispatchEvents(el) {
+  isReplayFilling = true;
   el.dispatchEvent(new Event('input', { bubbles: true }));
   el.dispatchEvent(new Event('change', { bubbles: true }));
+  isReplayFilling = false;
+}
+
+/**
+ * Simulates real user typing using execCommand('insertText'), which fires a
+ * genuinely trusted InputEvent (isTrusted=true). This is required for Angular
+ * autocomplete/search components that ignore synthetic events.
+ * Falls back to direct value + dispatchEvents if execCommand is unavailable.
+ */
+function nativeInput(el, value) {
+  el.focus();
+  // Select all text so insertText replaces it
+  if (typeof el.setSelectionRange === 'function') {
+    el.setSelectionRange(0, el.value.length);
+  }
+  // execCommand produces a trusted InputEvent the Angular component will respond to
+  const ok = document.execCommand('insertText', false, String(value));
+  if (!ok || el.value !== String(value)) {
+    // Fallback: direct assignment with synthetic events
+    el.value = String(value);
+    dispatchEvents(el);
+  }
 }
 
 // ─── Recording ───────────────────────────────────────────────────────────────
@@ -280,6 +306,35 @@ function waitForFillable(name) {
   });
 }
 
+/**
+ * For select elements whose options are populated by an API call:
+ * polls until the target option value exists in the <select>, then resolves it.
+ * Infinite wait (respects stepReplayActive).
+ */
+function waitForSelectOption(selectEl, targetValue) {
+  const target = String(targetValue);
+  const TIMEOUT_MS = 30_000;
+  return new Promise(resolve => {
+    const hasOption = () => Array.from(selectEl.options).some(o => o.value === target);
+    if (hasOption()) return resolve(selectEl);
+    log.info(`waitForSelectOption: "${target}" not yet present (${selectEl.options.length} options loaded)`);
+    const start = Date.now();
+    let lastLog = 0;
+    const id = setInterval(() => {
+      if (!stepReplayActive) { clearInterval(id); return resolve(null); }
+      if (hasOption()) { clearInterval(id); log.info(`waitForSelectOption: option "${target}" appeared`); return resolve(selectEl); }
+      const elapsed = Date.now() - start;
+      if (elapsed >= TIMEOUT_MS) {
+        clearInterval(id);
+        const existing = Array.from(selectEl.options).map(o => o.value).join(', ') || '(none)';
+        log.warn(`waitForSelectOption: timed out after ${TIMEOUT_MS/1000}s. Options present: ${existing}`);
+        return resolve(null);
+      }
+      if (elapsed - lastLog >= 2000) { lastLog = elapsed; log.info(`waitForSelectOption: waiting for option "${target}" (${Math.round(elapsed/1000)}s)`); }
+    }, 100);
+  });
+}
+
 // Waits for background to signal that the new tab was closed (5 min max)
 function waitForTabClose() {
   return new Promise(resolve => {
@@ -387,6 +442,7 @@ async function replaySteps(steps) {
           dispatchEvents(radio);
           await waitForNetwork();
         }
+        replayTargetValues.set(step.name, step.value);
       } else if (type === 'checkbox') {
         if (input.checked !== Boolean(step.value)) {
           const clickTarget = input.labels?.[0] || input.closest('label') || input.parentElement || input;
@@ -395,12 +451,29 @@ async function replaySteps(steps) {
           dispatchEvents(input);
           await waitForNetwork();
         }
+        replayTargetValues.set(step.name, step.value);
+      } else if (input.tagName === 'SELECT') {
+        // Focus + click the select to trigger any lazy-load API the component fires on open
+        input.focus();
+        input.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+        input.dispatchEvent(new MouseEvent('click',     { bubbles: true, cancelable: true, view: window }));
+        await waitForNetwork();
+        // Options may be populated by an API call — wait until the target option exists
+        const ready = await waitForSelectOption(input, step.value);
+        if (ready && ready.value !== String(step.value)) {
+          ready.value = String(step.value);
+          dispatchEvents(ready);
+          await waitForNetwork();
+        }
+        replayTargetValues.set(step.name, step.value);
       } else {
         if (input.value !== String(step.value)) {
           input.value = String(step.value);
           dispatchEvents(input);
+          input.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
           await waitForNetwork();
         }
+        replayTargetValues.set(step.name, step.value);
       }
 
     } else if (step.type === 'click') {
