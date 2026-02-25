@@ -292,7 +292,7 @@ function renderList(sessions, pathname, deviceId) {
     item.className = 'journey-item';
 
     const creatorTag = !isOwn
-      ? `<span class="creator-pill">${displayCreator(session.createdBy)}</span>`
+      ? `<span class="creator-pill">${session.displayName || displayCreator(session.createdBy)}</span>`
       : '';
 
     item.innerHTML = `
@@ -389,7 +389,6 @@ async function saveJourney(pathname, deviceId) {
 
   const userNameInput = document.getElementById('userName');
   const displayName = userNameInput ? userNameInput.value.trim() : '';
-  const createdBy = displayName || deviceId;
 
   const tab = await getTab();
   let current;
@@ -413,7 +412,8 @@ async function saveJourney(pathname, deviceId) {
     pathname,
     data: current,
     excluded: [],
-    createdBy,
+    createdBy: deviceId,
+    displayName: displayName || null,
   };
 
   try {
