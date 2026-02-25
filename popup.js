@@ -1,8 +1,8 @@
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
 
-function storageKey(pathname) {
-  return `journey_${pathname}`;
-}
+const API_BASE = 'http://localhost:3001/api/v1';
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function fmt(isoString) {
   const d = new Date(isoString);
@@ -24,6 +24,11 @@ function truncateValue(val) {
   return s.length > 28 ? s.slice(0, 28) + '…' : s;
 }
 
+/** Show a human-friendly creator name — hide raw UUIDs */
+function displayCreator(createdBy) {
+  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return uuidPattern.test(createdBy) ? 'Anonymous' : createdBy;
+}
 
 let statusTimer = null;
 
@@ -33,6 +38,25 @@ function setStatus(msg, type = 'default') {
   bar.className = type === 'error' ? 'error' : type === 'success' ? 'success' : '';
   if (statusTimer) clearTimeout(statusTimer);
   statusTimer = setTimeout(() => { bar.textContent = ''; bar.className = ''; }, 3000);
+}
+
+// ─── Identity ─────────────────────────────────────────────────────────────────
+
+async function getOrCreateDeviceId() {
+  const result = await chrome.storage.local.get('deviceId');
+  if (result.deviceId) return result.deviceId;
+  const id = uuid();
+  await chrome.storage.local.set({ deviceId: id });
+  return id;
+}
+
+async function getUserName() {
+  const result = await chrome.storage.local.get('userName');
+  return result.userName || '';
+}
+
+async function saveUserName(name) {
+  await chrome.storage.local.set({ userName: name });
 }
 
 // ─── Active replay state ──────────────────────────────────────────────────────
@@ -58,33 +82,32 @@ function setActiveReplay(session) {
   }
 }
 
-// ─── Storage ──────────────────────────────────────────────────────────────────
+// ─── API ──────────────────────────────────────────────────────────────────────
 
-async function getTab() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tab;
+async function apiFetch(path, options = {}) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { 'Content-Type': 'application/json' },
+    ...options,
+  });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+  return json;
 }
 
 async function loadSessions(pathname) {
-  const key = storageKey(pathname);
-  const result = await chrome.storage.local.get(key);
-  return (result[key] && result[key].sessions) ? result[key].sessions : [];
-}
-
-async function saveSessions(pathname, sessions) {
-  const key = storageKey(pathname);
-  await chrome.storage.local.set({ [key]: { sessions } });
+  try {
+    const { sessions } = await apiFetch(`/sessions?pathname=${encodeURIComponent(pathname)}`);
+    return sessions;
+  } catch (err) {
+    setStatus(`Could not reach server: ${err.message}`, 'error');
+    return [];
+  }
 }
 
 // ─── Copy Sheet ──────────────────────────────────────────────────────────────
 
-// copyData holds { title, sections: [{label, fields: {key:val}}] }
 let copyData = null;
 
-/**
- * @param {string} title - sheet title
- * @param {Array<{label:string|null, fields:{[k:string]:string}}>} sections
- */
 function openCopyPanel(title, sections) {
   copyData = { title, sections };
   document.getElementById('copySheetTitle').textContent = title;
@@ -142,7 +165,6 @@ function updateCopyCount() {
 async function copyFieldsToClipboard() {
   if (!copyData) return;
 
-  // Build a merged lookup of all fields across all sections
   const allFields = {};
   copyData.sections.forEach(({ fields }) => Object.assign(allFields, fields));
 
@@ -170,7 +192,7 @@ function enabledCount(session) {
   return Object.keys(session.data).length - excluded.size;
 }
 
-function buildFieldPanel(session, pathname) {
+function buildFieldPanel(session, pathname, deviceId) {
   const excluded = new Set(session.excluded || []);
   const fields = Object.entries(session.data);
 
@@ -209,7 +231,7 @@ function buildFieldPanel(session, pathname) {
 
     row.querySelector('input').addEventListener('change', async (e) => {
       row.classList.toggle('field-row-disabled', !e.target.checked);
-      await toggleExclusion(session.id, key, e.target.checked, pathname);
+      await toggleExclusion(session, key, e.target.checked);
     });
 
     list.appendChild(row);
@@ -219,22 +241,26 @@ function buildFieldPanel(session, pathname) {
   return panel;
 }
 
-async function toggleExclusion(sessionId, fieldName, isEnabled, pathname) {
-  const sessions = await loadSessions(pathname);
-  const session = sessions.find(s => s.id === sessionId);
-  if (!session) return;
-
+async function toggleExclusion(session, fieldName, isEnabled) {
   if (!session.excluded) session.excluded = [];
+
   if (isEnabled) {
     session.excluded = session.excluded.filter(f => f !== fieldName);
   } else if (!session.excluded.includes(fieldName)) {
     session.excluded.push(fieldName);
   }
 
-  await saveSessions(pathname, sessions);
+  try {
+    await apiFetch(`/sessions/${session.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ excluded: session.excluded }),
+    });
+  } catch (err) {
+    setStatus(`Failed to update fields: ${err.message}`, 'error');
+    return;
+  }
 
-  // Update count label in-place — no full re-render needed
-  const countEl = document.getElementById(`panel-count-${sessionId}`);
+  const countEl = document.getElementById(`panel-count-${session.id}`);
   if (countEl) {
     const total = Object.keys(session.data).length;
     countEl.textContent = `${total - session.excluded.length} of ${total} will prefill`;
@@ -243,7 +269,7 @@ async function toggleExclusion(sessionId, fieldName, isEnabled, pathname) {
 
 // ─── Render journey list ──────────────────────────────────────────────────────
 
-function renderList(sessions, pathname) {
+function renderList(sessions, pathname, deviceId) {
   const list = document.getElementById('journeyList');
 
   if (!sessions.length) {
@@ -260,9 +286,14 @@ function renderList(sessions, pathname) {
   sessions.forEach((session) => {
     const isActive = activeReplayId === session.id;
     const isPanelOpen = openPanelId === session.id;
+    const isOwn = session.createdBy === deviceId;
 
     const item = document.createElement('div');
     item.className = 'journey-item';
+
+    const creatorTag = !isOwn
+      ? `<span class="creator-pill">${displayCreator(session.createdBy)}</span>`
+      : '';
 
     item.innerHTML = `
       <div class="journey-icon">
@@ -276,6 +307,7 @@ function renderList(sessions, pathname) {
         <div class="journey-meta">
           <span class="journey-date">${fmt(session.savedAt)}</span>
           <span class="field-pill">${Object.keys(session.data).length} fields</span>
+          ${creatorTag}
         </div>
         <div class="journey-sub-actions"></div>
       </div>
@@ -283,7 +315,7 @@ function renderList(sessions, pathname) {
 
     const actions = item.querySelector('.journey-sub-actions');
 
-    // Settings / configure button
+    // Configure button
     const btnConfigure = document.createElement('button');
     btnConfigure.className = 'btn btn-ghost btn-sm btn-icon' + (isPanelOpen ? ' btn-active' : '');
     btnConfigure.title = 'Configure fields';
@@ -295,17 +327,15 @@ function renderList(sessions, pathname) {
       <line x1="17" y1="16" x2="23" y2="16"/>
     </svg>`;
     btnConfigure.addEventListener('click', () => {
-      // Close any existing panel
       document.querySelectorAll('.field-panel').forEach(p => p.remove());
       document.querySelectorAll('.btn-active').forEach(b => b.classList.remove('btn-active'));
 
       if (openPanelId === session.id) {
-        // Toggle off
         openPanelId = null;
       } else {
         openPanelId = session.id;
         btnConfigure.classList.add('btn-active');
-        const panel = buildFieldPanel(session, pathname);
+        const panel = buildFieldPanel(session, pathname, deviceId);
         item.insertAdjacentElement('afterend', panel);
       }
     });
@@ -318,23 +348,24 @@ function renderList(sessions, pathname) {
       ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>`
       : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor" stroke="none"/></svg>`;
     btnReplay.disabled = isActive;
-    btnReplay.addEventListener('click', () => startReplay(session, pathname));
+    btnReplay.addEventListener('click', () => startReplay(session, pathname, deviceId));
 
-    // Delete button
-    const btnDelete = document.createElement('button');
-    btnDelete.className = 'btn btn-danger-ghost btn-sm btn-icon';
-    btnDelete.title = 'Delete';
-    btnDelete.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg>`;
-    btnDelete.addEventListener('click', () => deleteSession(session.id, pathname));
+    // Delete — only for sessions you own
+    if (isOwn) {
+      const btnDelete = document.createElement('button');
+      btnDelete.className = 'btn btn-danger-ghost btn-sm btn-icon';
+      btnDelete.title = 'Delete';
+      btnDelete.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg>`;
+      btnDelete.addEventListener('click', () => deleteSession(session.id, pathname, deviceId));
+      actions.appendChild(btnDelete);
+    }
 
     actions.appendChild(btnConfigure);
-    actions.appendChild(btnDelete);
     item.appendChild(btnReplay);
     list.appendChild(item);
 
-    // Re-attach open panel after re-render
     if (isPanelOpen) {
-      const panel = buildFieldPanel(session, pathname);
+      const panel = buildFieldPanel(session, pathname, deviceId);
       list.appendChild(panel);
     }
   });
@@ -342,7 +373,12 @@ function renderList(sessions, pathname) {
 
 // ─── Actions ──────────────────────────────────────────────────────────────────
 
-async function saveJourney(pathname) {
+async function getTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
+}
+
+async function saveJourney(pathname, deviceId) {
   const nameInput = document.getElementById('journeyName');
   const label = nameInput.value.trim();
   if (!label) {
@@ -350,6 +386,10 @@ async function saveJourney(pathname) {
     nameInput.focus();
     return;
   }
+
+  const userNameInput = document.getElementById('userName');
+  const displayName = userNameInput ? userNameInput.value.trim() : '';
+  const createdBy = displayName || deviceId;
 
   const tab = await getTab();
   let current;
@@ -366,23 +406,31 @@ async function saveJourney(pathname) {
     return;
   }
 
-  const sessions = await loadSessions(pathname);
-  sessions.unshift({
+  const session = {
     id: uuid(),
     label,
     savedAt: new Date().toISOString(),
+    pathname,
     data: current,
     excluded: [],
-  });
+    createdBy,
+  };
 
-  await saveSessions(pathname, sessions);
-  nameInput.value = '';
-  setStatus(`Saved "${label}" — ${Object.keys(current).length} fields.`, 'success');
-  renderList(sessions, pathname);
+  try {
+    await apiFetch('/sessions', {
+      method: 'POST',
+      body: JSON.stringify(session),
+    });
+    nameInput.value = '';
+    setStatus(`Saved "${label}" — ${Object.keys(current).length} fields.`, 'success');
+    const sessions = await loadSessions(pathname);
+    renderList(sessions, pathname, deviceId);
+  } catch (err) {
+    setStatus(`Save failed: ${err.message}`, 'error');
+  }
 }
 
-async function startReplay(session, pathname) {
-  // Filter out excluded fields before sending
+async function startReplay(session, pathname, deviceId) {
   const excluded = new Set(session.excluded || []);
   const filteredData = Object.fromEntries(
     Object.entries(session.data).filter(([key]) => !excluded.has(key))
@@ -397,13 +445,14 @@ async function startReplay(session, pathname) {
       ? `Replay started — ${skipped} field${skipped > 1 ? 's' : ''} skipped.`
       : `Replay started for "${session.label}".`;
     setStatus(msg, 'success');
-    renderList(await loadSessions(pathname), pathname);
+    const sessions = await loadSessions(pathname);
+    renderList(sessions, pathname, deviceId);
   } catch {
     setStatus('Could not connect to page. Reload the form tab.', 'error');
   }
 }
 
-async function stopReplay(pathname) {
+async function stopReplay(pathname, deviceId) {
   const tab = await getTab();
   try {
     await chrome.tabs.sendMessage(tab.id, { type: 'STOP_REPLAY' });
@@ -412,41 +461,55 @@ async function stopReplay(pathname) {
   }
   setActiveReplay(null);
   setStatus('Replay stopped.', 'default');
-  renderList(await loadSessions(pathname), pathname);
+  const sessions = await loadSessions(pathname);
+  renderList(sessions, pathname, deviceId);
 }
 
-async function deleteSession(id, pathname) {
-  let sessions = await loadSessions(pathname);
-  sessions = sessions.filter((s) => s.id !== id);
-  await saveSessions(pathname, sessions);
+async function deleteSession(id, pathname, deviceId) {
+  try {
+    await apiFetch(`/sessions/${id}`, { method: 'DELETE' });
+  } catch (err) {
+    setStatus(`Delete failed: ${err.message}`, 'error');
+    return;
+  }
 
   if (openPanelId === id) openPanelId = null;
 
   if (activeReplayId === id) {
-    await stopReplay(pathname);
+    await stopReplay(pathname, deviceId);
   } else {
     setStatus('Journey deleted.', 'default');
-    renderList(sessions, pathname);
+    const sessions = await loadSessions(pathname);
+    renderList(sessions, pathname, deviceId);
   }
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
 async function init() {
+  const deviceId = await getOrCreateDeviceId();
   const tab = await getTab();
   const url = new URL(tab.url);
   const pathname = url.pathname;
 
-  const sessions = await loadSessions(pathname);
-  renderList(sessions, pathname);
+  // Restore saved user name
+  const savedName = await getUserName();
+  const userNameInput = document.getElementById('userName');
+  if (userNameInput && savedName) userNameInput.value = savedName;
+  if (userNameInput) {
+    userNameInput.addEventListener('blur', () => saveUserName(userNameInput.value.trim()));
+  }
 
-  document.getElementById('btnSave').addEventListener('click', () => saveJourney(pathname));
+  const sessions = await loadSessions(pathname);
+  renderList(sessions, pathname, deviceId);
+
+  document.getElementById('btnSave').addEventListener('click', () => saveJourney(pathname, deviceId));
 
   document.getElementById('journeyName').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') saveJourney(pathname);
+    if (e.key === 'Enter') saveJourney(pathname, deviceId);
   });
 
-  document.getElementById('btnStopReplay').addEventListener('click', () => stopReplay(pathname));
+  document.getElementById('btnStopReplay').addEventListener('click', () => stopReplay(pathname, deviceId));
 
   // Copy sheet
   document.getElementById('sheetOverlay').addEventListener('click', closeCopyPanel);

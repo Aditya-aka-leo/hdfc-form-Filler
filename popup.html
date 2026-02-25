@@ -339,6 +339,21 @@
       letter-spacing: 0.2px;
     }
 
+    .creator-pill {
+      font-size: 9px;
+      font-weight: 600;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: var(--accent-dim);
+      border: 1px solid rgba(124,106,247,0.2);
+      color: var(--accent);
+      letter-spacing: 0.2px;
+      max-width: 80px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
     .btn-play {
       width: 42px;
       height: 42px;
@@ -713,6 +728,11 @@
   <!-- Save section -->
   <div class="card">
     <div class="card-header">Save journey</div>
+    <div class="save-row" style="padding-bottom: 4px;">
+      <div class="input-wrap">
+        <input type="text" id="userName" placeholder="Your name (e.g. Rahul)" maxlength="40" />
+      </div>
+    </div>
     <div class="save-row">
       <div class="input-wrap">
         <input type="text" id="journeyName" placeholder="e.g. Self Employed – Test" maxlength="60" />
