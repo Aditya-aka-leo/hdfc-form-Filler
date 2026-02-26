@@ -114,24 +114,65 @@ function dispatchEvents(el) {
 }
 
 /**
- * Simulates real user typing using execCommand('insertText'), which fires a
- * genuinely trusted InputEvent (isTrusted=true). This is required for Angular
- * autocomplete/search components that ignore synthetic events.
- * Falls back to direct value + dispatchEvents if execCommand is unavailable.
+ * Types text into an input one character at a time using execCommand('insertText').
+ * Each character fires a trusted InputEvent (isTrusted=true), which is required for
+ * Angular typeahead/autocomplete components that ignore synthetic events.
  */
-function nativeInput(el, value) {
+async function typeCharByChar(el, text) {
   el.focus();
-  // Select all text so insertText replaces it
-  if (typeof el.setSelectionRange === 'function') {
-    el.setSelectionRange(0, el.value.length);
+  // Clear any existing value first
+  if (el.value) {
+    el.setSelectionRange?.(0, el.value.length);
+    document.execCommand('selectAll', false);
+    document.execCommand('delete', false);
   }
-  // execCommand produces a trusted InputEvent the Angular component will respond to
-  const ok = document.execCommand('insertText', false, String(value));
-  if (!ok || el.value !== String(value)) {
-    // Fallback: direct assignment with synthetic events
-    el.value = String(value);
-    dispatchEvents(el);
+  for (const char of String(text)) {
+    document.execCommand('insertText', false, char);
+    await new Promise(r => setTimeout(r, 40));
   }
+}
+
+/**
+ * Waits for a dropdown overlay option (mat-option, [role="option"]) whose text or
+ * data-value matches target. Used after typeCharByChar triggers the search API.
+ */
+function waitForDropdownOption(target) {
+  const t = String(target);
+  const TIMEOUT_MS = 5_000;
+  const SELECTORS = [
+    '.dropdown-option',                                        // dynamic-dropdown-wrapper (HDFC custom)
+    '[role="option"]', 'mat-option', '.mat-option',
+    '.dropdown-item', '.ng-option', 'li[role="option"]',
+    '[role="listbox"] li', '[role="listbox"] > *',
+    '.cdk-overlay-container li', '.cdk-overlay-container [role="option"]',
+    '.mat-autocomplete-panel li', '.mat-autocomplete-panel mat-option',
+    '.autocomplete-option', '.suggestion-item',
+    'ul.dropdown-menu li', 'li.ui-autocomplete-item',
+  ].join(', ');
+  const find = () => Array.from(document.querySelectorAll(SELECTORS)).find(el => {
+    const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    return text === t || text.includes(t) || el.getAttribute('data-value') === t;
+  });
+  return new Promise(resolve => {
+    const el = find();
+    if (el) return resolve(el);
+    const start = Date.now();
+    const id = setInterval(() => {
+      if (!stepReplayActive) { clearInterval(id); return resolve(null); }
+      const el = find();
+      if (el) { clearInterval(id); log.info(`waitForDropdownOption: found "${t}"`); return resolve(el); }
+      if (Date.now() - start >= TIMEOUT_MS) {
+        clearInterval(id);
+        // Show every leaf element in the DOM that contains the target text
+        const withTarget = Array.from(document.querySelectorAll('*'))
+          .filter(el => el.children.length === 0 && (el.textContent || '').includes(t))
+          .slice(0, 5)
+          .map(el => `<${el.tagName.toLowerCase()} class="${el.className}"> "${(el.textContent||'').trim().slice(0,60)}" (parent: <${el.parentElement?.tagName?.toLowerCase()} class="${el.parentElement?.className}">)`);
+        log.warn(`waitForDropdownOption: timed out for "${t}".\nDOM elements containing target:\n${withTarget.join('\n') || '(none — option not in DOM yet)'}`);
+        return resolve(null);
+      }
+    }, 100);
+  });
 }
 
 // ─── Recording ───────────────────────────────────────────────────────────────
@@ -164,8 +205,12 @@ function handleStepChange(e) {
   const type = input.type.toLowerCase();
   const name = input.name;
   const value = type === 'radio' ? input.value : type === 'checkbox' ? input.checked : input.value;
-  recordedSteps.push({ type: 'fill', name, value, inputType: type });
-  log.info('recorded fill:', name, '=', value);
+  // For selects, also record the display label so typeahead can filter by text
+  const label = (type === 'select-one' && input.selectedIndex >= 0)
+    ? (input.options[input.selectedIndex]?.text || '')
+    : undefined;
+  recordedSteps.push({ type: 'fill', name, value, inputType: type, ...(label !== undefined && { label }) });
+  log.info('recorded fill:', name, '=', value, label ? `(label: ${label})` : '');
 }
 
 function handleStepClick(e) {
@@ -313,21 +358,33 @@ function waitForFillable(name) {
  */
 function waitForSelectOption(selectEl, targetValue) {
   const target = String(targetValue);
-  const TIMEOUT_MS = 30_000;
+  const TIMEOUT_MS = 5_000;
+  // Match by value OR by trimmed display text (handles cases where .value differs from recorded)
+  const findOption = () => Array.from(selectEl.options).find(
+    o => o.value === target || o.text.trim() === target
+  );
   return new Promise(resolve => {
-    const hasOption = () => Array.from(selectEl.options).some(o => o.value === target);
-    if (hasOption()) return resolve(selectEl);
+    const opt = findOption();
+    if (opt) return resolve({ el: selectEl, option: opt });
     log.info(`waitForSelectOption: "${target}" not yet present (${selectEl.options.length} options loaded)`);
     const start = Date.now();
     let lastLog = 0;
     const id = setInterval(() => {
       if (!stepReplayActive) { clearInterval(id); return resolve(null); }
-      if (hasOption()) { clearInterval(id); log.info(`waitForSelectOption: option "${target}" appeared`); return resolve(selectEl); }
+      const opt = findOption();
+      if (opt) { clearInterval(id); log.info(`waitForSelectOption: option "${target}" appeared`); return resolve({ el: selectEl, option: opt }); }
       const elapsed = Date.now() - start;
       if (elapsed >= TIMEOUT_MS) {
         clearInterval(id);
-        const existing = Array.from(selectEl.options).map(o => o.value).join(', ') || '(none)';
-        log.warn(`waitForSelectOption: timed out after ${TIMEOUT_MS/1000}s. Options present: ${existing}`);
+        const allOpts = Array.from(selectEl.options);
+        const existing = allOpts.map(o => o.text.trim()).join(', ') || '(none)';
+        // Fall back to first option with a non-empty value (skip placeholder)
+        const firstReal = allOpts.find(o => o.value !== '');
+        if (firstReal) {
+          log.warn(`waitForSelectOption: "${target}" not found — selecting first option "${firstReal.text.trim()}" as fallback. Options: ${existing}`);
+          return resolve({ el: selectEl, option: firstReal });
+        }
+        log.warn(`waitForSelectOption: timed out after ${TIMEOUT_MS/1000}s — skipping. Options: ${existing}`);
         return resolve(null);
       }
       if (elapsed - lastLog >= 2000) { lastLog = elapsed; log.info(`waitForSelectOption: waiting for option "${target}" (${Math.round(elapsed/1000)}s)`); }
@@ -429,8 +486,12 @@ async function replaySteps(steps) {
       if (!_n || _n.startsWith('hidden') || _n.toLowerCase().includes('otp') || input.readOnly || input.disabled) {
         log.warn('fill: skipping', step.name); log.end(); continue;
       }
-
       const type = (step.inputType || input.type)?.toLowerCase();
+      // Skip empty-value select steps — they represent intermediate cleared states (e.g.
+      // the component resetting before a real selection) and actively break typeahead replay.
+      if (type === 'select-one' && (step.value === '' || step.value === null || step.value === undefined)) {
+        log.info(`fill: skipping empty select value for "${step.name}"`); log.end(); continue;
+      }
       log.info(`fill: [${step.name}] type=${type} value="${step.value}"`);
 
       if (type === 'radio') {
@@ -453,21 +514,59 @@ async function replaySteps(steps) {
         }
         replayTargetValues.set(step.name, step.value);
       } else if (input.tagName === 'SELECT') {
-        // Focus + click the select to trigger any lazy-load API the component fires on open
-        input.focus();
-        input.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-        input.dispatchEvent(new MouseEvent('click',     { bubbles: true, cancelable: true, view: window }));
-        await waitForNetwork();
-        // Options may be populated by an API call — wait until the target option exists
-        const ready = await waitForSelectOption(input, step.value);
-        if (ready && ready.value !== String(step.value)) {
-          ready.value = String(step.value);
-          dispatchEvents(ready);
+        // Typeahead selects hide the <select> (display:none) and show a custom input instead.
+        // Regular native dropdowns keep the <select> visible — use direct value assignment for those.
+        const isTypeahead = input.style.display === 'none' || isHidden(input);
+
+        const container = input.closest('mat-form-field, [class*="form-field"], [class*="field-wrap"], .ng-select')
+          || input.parentElement?.parentElement
+          || input.parentElement;
+        const typeaheadInput = isTypeahead && container
+          ? Array.from(container.querySelectorAll('input')).find(el => !isHidden(el) && !el.readOnly && !el.disabled)
+          : null;
+
+        if (typeaheadInput) {
+          // Typeahead: type the label (display text) char-by-char so the filter matches,
+          // then click the overlay option. Fall back to value if no label recorded.
+          const typeText = step.label || String(step.value);
+          log.info(`fill: [${step.name}] typeahead — typing "${typeText}" char-by-char`);
+          await typeCharByChar(typeaheadInput, typeText);
           await waitForNetwork();
+          const overlayOpt = await waitForDropdownOption(String(step.value));
+          if (overlayOpt) {
+            overlayOpt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+            overlayOpt.click();
+            await waitForNetwork();
+          } else {
+            // Overlay didn't appear — fall through to native select approach
+            const result = await waitForSelectOption(input, step.value);
+            if (result) {
+              result.el.value = result.option.value;
+              dispatchEvents(result.el);
+              await waitForNetwork();
+            }
+          }
+        } else {
+          // Native select: focus+click to trigger lazy-load, then set value directly
+          input.focus();
+          input.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+          input.dispatchEvent(new MouseEvent('click',     { bubbles: true, cancelable: true, view: window }));
+          await waitForNetwork();
+          const result = await waitForSelectOption(input, step.value);
+          if (result) {
+            result.el.value = result.option.value;
+            dispatchEvents(result.el);
+            await waitForNetwork();
+          }
         }
         replayTargetValues.set(step.name, step.value);
       } else {
         if (input.value !== String(step.value)) {
+          // Clear any existing value first so Angular sees a clean transition
+          if (input.value) {
+            input.value = '';
+            dispatchEvents(input);
+          }
           input.value = String(step.value);
           dispatchEvents(input);
           input.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
