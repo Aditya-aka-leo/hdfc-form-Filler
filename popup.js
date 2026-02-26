@@ -213,7 +213,7 @@ function enabledCount(session) {
   return Object.keys(session.data).length - excluded.size;
 }
 
-function buildFieldPanel(session, pathname, deviceId) {
+function buildFieldPanel(session) {
   const excluded = new Set(session.excluded || []);
   const fields = Object.entries(session.data);
 
@@ -358,12 +358,12 @@ function renderList(sessions, pathname, deviceId) {
       } else {
         openPanelId = session.id;
         btnConfigure.classList.add('btn-active');
-        const panel = buildFieldPanel(session, pathname, deviceId);
+        const panel = buildFieldPanel(session);
         item.insertAdjacentElement('afterend', panel);
       }
     });
 
-    // Share button — only for local (offline) saves
+    // Share button — for local (offline) saves: uploads whole session to server
     if (isLocal) {
       const btnShare = document.createElement('button');
       btnShare.className = 'btn btn-accent btn-sm';
@@ -372,6 +372,7 @@ function renderList(sessions, pathname, deviceId) {
       btnShare.addEventListener('click', () => shareSession(session, pathname, deviceId));
       actions.appendChild(btnShare);
     }
+
 
     // Replay Journey button (step replay) — only shown when steps are recorded
     if (session.steps && session.steps.length > 0) {
@@ -407,7 +408,7 @@ function renderList(sessions, pathname, deviceId) {
     list.appendChild(item);
 
     if (isPanelOpen) {
-      const panel = buildFieldPanel(session, pathname, deviceId);
+      const panel = buildFieldPanel(session);
       list.appendChild(panel);
     }
   });
@@ -459,26 +460,33 @@ async function saveJourney(pathname, deviceId) {
   };
 
   let steps = [];
-  const shareSteps = document.getElementById('shareStepsToggle')?.checked;
+  const shareWithTeam = document.getElementById('shareStepsToggle')?.checked;
   try {
     const stepsResponse = await chrome.tabs.sendMessage(tab.id, { type: 'GET_STEPS' });
     steps = stepsResponse.steps || [];
-    if (steps.length && shareSteps) {
-      session.steps = steps; // include in POST body so teammates get them
-    }
   } catch { /* ignore */ }
+
+  // Toggle OFF → save locally only, no DB. User can share later via the Share button.
+  if (!shareWithTeam) {
+    const localSession = { ...session, steps, _local: true };
+    await chrome.storage.local.set({ [`local_${session.id}`]: localSession });
+    nameInput.value = '';
+    setStatus(`"${label}" saved locally. Enable "Share steps with team" to share.`, 'default');
+    const sessions = await loadSessions(pathname);
+    renderList(sessions, pathname, deviceId);
+    return;
+  }
+
+  // Toggle ON → save to DB with steps so teammates can replay
+  if (steps.length) session.steps = steps;
 
   try {
     await apiFetch('/sessions', {
       method: 'POST',
       body: JSON.stringify(session),
     });
-    // API succeeded — store steps locally if not shared via API
-    if (steps.length && !shareSteps) {
-      await chrome.storage.local.set({ [`steps_${session.id}`]: steps });
-    }
     nameInput.value = '';
-    setStatus(`Saved "${label}" — ${Object.keys(current).length} fields.`, 'success');
+    setStatus(`Saved & shared "${label}" — ${Object.keys(current).length} fields.`, 'success');
     const sessions = await loadSessions(pathname);
     renderList(sessions, pathname, deviceId);
   } catch {
@@ -547,6 +555,7 @@ async function shareSession(session, pathname, deviceId) {
     setStatus(`Share failed: ${err.message}`, 'error');
   }
 }
+
 
 async function deleteSession(id, pathname, deviceId) {
   // Local-only session — just remove from chrome.storage.local
