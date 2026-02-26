@@ -222,24 +222,58 @@ chrome.storage.local.get('allowedPatterns').then(({ allowedPatterns }) => {
   activate();
 });
 
+// Synchronously restore recording state BEFORE activating listeners
+// This prevents form change events from firing before old steps are restored
+function restoreRecordingStateSync() {
+  try {
+    const raw = window.localStorage.getItem(LS_KEY);
+    if (!raw) return;
+    const { data, steps, savedAt } = JSON.parse(raw);
+    const expired = Date.now() - savedAt > 2 * 60 * 60 * 1000; // 2 hours
+    if (expired) {
+      window.localStorage.removeItem(LS_KEY);
+      log.info('recording restore: state expired — cleared');
+      return;
+    }
+    // Restore steps BEFORE listeners are attached
+    if (recordedSteps.length === 0) {
+      Object.assign(recordedData, data);
+      recordedSteps.push(...steps);
+      log.info(`recording restore: ✅ restored — ${Object.keys(data).length} field(s), ${steps.length} step(s) (before listeners attached)`);
+    }
+  } catch (e) { 
+    log.warn('recording restore: error reading localStorage —', e); 
+  }
+}
+
 function activate() {
 log.info('activate: fired —', window.location.href);
-document.addEventListener('input', handleInputChange, true);
-document.addEventListener('change', handleInputChange, true);
+
+// Restore old recording state BEFORE attaching listeners (prevents new steps from being recorded before old ones are restored)
+restoreRecordingStateSync();
 
 // ─── Resume replay after same-tab redirect (e.g. Perfios) ────────────────────
 // Ask background if there is a pending resume state for this tab.
 // Background holds it in chrome.storage.session (survives SW restarts).
 // Intermediate pages (Perfios) get { resume: false } — state is preserved.
+// Only restore recording state if this is an actual redirect flow.
+let isRedirectFlow = false;
+
 chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
   if (!response?.resume) {
     if (response?.pendingState) {
+      isRedirectFlow = true; // We're in the middle of a redirect flow
       log.info(`replay restore: ⏸ pending state found but still on intermediate domain — waiting to resume at ${response.expectedPath}`);
     } else {
-      log.info('replay restore: no pending state for this page');
+      // No redirect flow — clear any stale recording state
+      if (!isRedirectFlow) {
+        log.info('replay restore: no pending state for this page');
+        window.localStorage.removeItem(LS_KEY);
+      }
     }
     return;
   }
+  isRedirectFlow = true;
   const { steps, resumeFromStep, stopAfterIndex } = response;
   log.info(`replay restore: ✅ state found — resuming from step ${resumeFromStep + 1}/${steps.length}, stopAfter=${stopAfterIndex}, url=${window.location.pathname}`);
   // Brief pause to let the form's scripts fire their initial API calls (ASE polling etc.),
@@ -258,30 +292,10 @@ chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
   });
 }).catch(err => { log.warn('replay restore: FORM_READY message failed —', err); });
 
-// ─── Restore recording state after same-tab navigation ───────────────────────
-// If the user was recording and the page navigated (e.g. to Perfios), the
-// in-memory recordedData/recordedSteps were wiped. Restore them here so the
-// user can continue recording on the callback page and save the full journey.
-try {
-  const raw = window.localStorage.getItem(LS_KEY);
-  log.info('recording restore: localStorage —', raw ? 'state found' : 'no saved state');
-  if (raw) {
-    const { data, steps, savedAt } = JSON.parse(raw);
-    const expired = Date.now() - savedAt > 2 * 60 * 60 * 1000; // 2 hours
-    const ageMin = Math.round((Date.now() - savedAt) / 60000);
-    log.info(`recording restore: ${steps?.length} step(s), ${Object.keys(data || {}).length} field(s), age=${ageMin}min, expired=${expired}`);
-    if (expired) {
-      window.localStorage.removeItem(LS_KEY);
-      log.info('recording restore: state expired — cleared');
-    } else if (Object.keys(recordedData).length === 0 && recordedSteps.length === 0) {
-      Object.assign(recordedData, data);
-      recordedSteps.push(...steps);
-      log.info(`recording restore: ✅ restored — ${Object.keys(data).length} field(s), ${steps.length} step(s)`);
-    } else {
-      log.info(`recording restore: ⚠️ skipped — memory already has ${recordedSteps.length} step(s) (fresh recording in progress?)`);
-    }
-  }
-} catch (e) { log.warn('recording restore: error reading localStorage —', e); }
+// Attach listeners AFTER restoration and FORM_READY check
+document.addEventListener('input', handleInputChange, true);
+document.addEventListener('change', handleInputChange, true);
+
 
 
 // ─── Step Recording ───────────────────────────────────────────────────────────
@@ -299,6 +313,14 @@ function handleStepChange(e) {
   const label = (type === 'select-one' && input.selectedIndex >= 0)
     ? (input.options[input.selectedIndex]?.text || '')
     : undefined;
+  
+  // Deduplicate: skip if the last step is an identical fill for the same field
+  const lastStep = recordedSteps[recordedSteps.length - 1];
+  if (lastStep && lastStep.type === 'fill' && lastStep.name === name && lastStep.value === value) {
+    log.info('skipped duplicate fill:', name, '=', value);
+    return;
+  }
+  
   recordedSteps.push({ type: 'fill', name, value, inputType: type, ...(label !== undefined && { label }) });
   log.info('recorded fill:', name, '=', value, label ? `(label: ${label})` : '');
   persistRecordingState();
@@ -330,12 +352,22 @@ function handleStepClick(e) {
     pendingMarkRedirect = null;
   }
   const redirectStepIndex = recordedSteps.length - 1;
+  const originalUrl = window.location.pathname;
   const markRedirect = () => {
     pendingMarkRedirect = null;
     if (recordedSteps[redirectStepIndex]?.type === 'click') {
-      recordedSteps[redirectStepIndex].expectsRedirect = true;
+      // Distinguish reload (same URL) vs redirect (different URL)
+      const isReload = window.location.pathname === originalUrl;
+      recordedSteps[redirectStepIndex].expectsRedirect = !isReload;
+      if (isReload) {
+        recordedSteps[redirectStepIndex].expectsReload = true;
+        // Clear recording state from localStorage before reload to suppress restore logs
+        window.localStorage.removeItem(LS_KEY);
+        log.info('recorded reload: clearing recording state from localStorage');
+      }
       persistRecordingState();
-      log.info('recorded redirect: step', redirectStepIndex + 1, 'marked as expectsRedirect=true');
+      const navType = isReload ? 'reload' : 'redirect';
+      log.info(`recorded ${navType}: step ${redirectStepIndex + 1} marked as expects${isReload ? 'Reload' : 'Redirect'}=true`);
     }
   };
   pendingMarkRedirect = markRedirect;
