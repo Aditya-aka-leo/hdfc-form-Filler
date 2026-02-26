@@ -449,18 +449,14 @@ function waitForElement(selector, timeout = 2000) {
   });
 }
 
-/** Polls until a fill-step's input exists in the DOM AND is visible on screen.
- *  "Visible" means: not hidden via data-visible="false" AND has non-zero layout dimensions.
- *  After 30s we fall back and return the element even if still hidden, to avoid hanging forever
- *  on fields that are legitimately in a hidden-but-fillable state. */
+/** Polls until a fill-step's input exists in the DOM AND is not hidden by AEM
+ *  (no ancestor with data-visible="false"). We intentionally do NOT check
+ *  getBoundingClientRect here — typeahead selects have display:none on the native
+ *  <select> but no data-visible="false" ancestor, so they must pass immediately.
+ *  After 30s we fall back and return the element even if still hidden. */
 function waitForFillable(name) {
   const selector = `[name="${CSS.escape(name)}"]`;
   const VISIBILITY_TIMEOUT_MS = 30_000;
-  const isVisible = el => {
-    if (isHidden(el)) return false;
-    const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0;
-  };
   log.info(`waitForFillable: "${name}"`);
   return new Promise(resolve => {
     const start = Date.now();
@@ -470,18 +466,18 @@ function waitForFillable(name) {
       const el = document.querySelector(selector);
       const elapsed = Date.now() - start;
       if (el) {
-        if (isVisible(el)) {
+        if (!isHidden(el)) {
           clearInterval(id);
           log.info(`waitForFillable: ready "${name}"`);
           return resolve(el);
         }
-        // Element exists but not yet visible — wait up to VISIBILITY_TIMEOUT_MS
+        // AEM has this field's section marked data-visible="false" — wait for it
         if (elapsed >= VISIBILITY_TIMEOUT_MS) {
           clearInterval(id);
-          log.warn(`waitForFillable: "${name}" still hidden/off-screen after 30s — filling anyway`);
+          log.warn(`waitForFillable: "${name}" still hidden after 30s — filling anyway`);
           return resolve(el);
         }
-        if (elapsed - lastLog >= 2000) { lastLog = elapsed; log.info(`waitForFillable: "${name}" in DOM but not visible yet (${Math.round(elapsed/1000)}s) — waiting`); }
+        if (elapsed - lastLog >= 2000) { lastLog = elapsed; log.info(`waitForFillable: "${name}" in DOM but hidden (${Math.round(elapsed/1000)}s) — waiting`); }
         return;
       }
       if (elapsed - lastLog >= 2000) { lastLog = elapsed; log.info(`waitForFillable: "${name}" not in DOM (${Math.round(elapsed/1000)}s)`); }
