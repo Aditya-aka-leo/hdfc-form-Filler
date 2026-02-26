@@ -484,9 +484,16 @@ function waitForTabVisible() {
 
 async function replaySteps(steps, stopAfterIndex = -1) {
   log.info(`replaySteps: starting — ${steps.length} step(s)${stopAfterIndex >= 0 ? `, stop after step ${stopAfterIndex + 1}` : ''}`);
+  console.log('[Recorder] replaySteps stopAfterIndex =', stopAfterIndex);
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     if (!stepReplayActive) { log.info('replaySteps: stopped'); break; }
+    // Safety: if a previous iteration used `continue` and skipped the end-of-loop
+    // stop check, catch it here at the start of the next iteration.
+    if (stopAfterIndex >= 0 && i > stopAfterIndex) {
+      log.info('replaySteps: stop checkpoint passed — halting before step', i + 1);
+      break;
+    }
 
     await waitForTabVisible();
     log.group(`Step ${i + 1}/${steps.length}: ${step.type} — ${step.name || step.text || ''}`);

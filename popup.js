@@ -612,6 +612,7 @@ async function startReplay(session, pathname, deviceId, mode = 'prefill') {
   try {
     if (mode === 'steps' && session.steps && session.steps.length > 0) {
       const { [`stopAfterStep_${session.id}`]: stopAfterIndex } = await chrome.storage.local.get(`stopAfterStep_${session.id}`);
+      console.log('[Recorder] startReplay: stopAfterIndex =', stopAfterIndex, '→ sending', stopAfterIndex ?? -1);
       await chrome.tabs.sendMessage(tab.id, {
         type: 'START_STEP_REPLAY',
         steps: session.steps,
