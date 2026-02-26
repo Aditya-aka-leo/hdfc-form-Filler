@@ -8,6 +8,7 @@ let pendingFill = false;
 let activeRequests = 0;
 let stepReplayActive = false;
 let lastApiError = false;
+let pendingMarkRedirect = null; // tracks the one click whose beforeunload listener is still active
 let isReplayFilling = false;          // true only while dispatchEvents() is running
 const userModifiedDuringReplay = new Set(); // field names the user manually touched during replay
 const replayTargetValues = new Map(); // fieldName → value the replay last set
@@ -222,6 +223,7 @@ chrome.storage.local.get('allowedPatterns').then(({ allowedPatterns }) => {
 });
 
 function activate() {
+log.info('activate: fired —', window.location.href);
 document.addEventListener('input', handleInputChange, true);
 document.addEventListener('change', handleInputChange, true);
 
@@ -231,12 +233,21 @@ document.addEventListener('change', handleInputChange, true);
 // Intermediate pages (Perfios) get { resume: false } — state is preserved.
 chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
   if (!response?.resume) {
-    log.info('replay restore: no pending state for this page (intermediate page or no redirect)');
+    if (response?.pendingState) {
+      log.info(`replay restore: ⏸ pending state found but still on intermediate domain — waiting to resume at ${response.expectedPath}`);
+    } else {
+      log.info('replay restore: no pending state for this page');
+    }
     return;
   }
   const { steps, resumeFromStep, stopAfterIndex } = response;
   log.info(`replay restore: ✅ state found — resuming from step ${resumeFromStep + 1}/${steps.length}, stopAfter=${stopAfterIndex}, url=${window.location.pathname}`);
-  await new Promise(r => setTimeout(r, 2000));
+  // Brief pause to let the form's scripts fire their initial API calls (ASE polling etc.),
+  // then wait for all in-flight requests to settle before touching any fields.
+  await new Promise(r => setTimeout(r, 1000));
+  await waitForNetwork();
+  log.info('replay restore: network idle — form initialization complete');
+  await new Promise(r => setTimeout(r, 500));
   stepReplayActive = true;
   const slicedSteps = steps.slice(resumeFromStep);
   const adjustedStop = stopAfterIndex >= resumeFromStep ? stopAfterIndex - resumeFromStep : -1;
@@ -253,19 +264,24 @@ chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
 // user can continue recording on the callback page and save the full journey.
 try {
   const raw = window.localStorage.getItem(LS_KEY);
+  log.info('recording restore: localStorage —', raw ? 'state found' : 'no saved state');
   if (raw) {
-    const { data, steps, pathname, savedAt } = JSON.parse(raw);
-    const currentPath = window.location.origin + window.location.pathname;
+    const { data, steps, savedAt } = JSON.parse(raw);
     const expired = Date.now() - savedAt > 2 * 60 * 60 * 1000; // 2 hours
-    if (expired || pathname !== currentPath) {
+    const ageMin = Math.round((Date.now() - savedAt) / 60000);
+    log.info(`recording restore: ${steps?.length} step(s), ${Object.keys(data || {}).length} field(s), age=${ageMin}min, expired=${expired}`);
+    if (expired) {
       window.localStorage.removeItem(LS_KEY);
+      log.info('recording restore: state expired — cleared');
     } else if (Object.keys(recordedData).length === 0 && recordedSteps.length === 0) {
       Object.assign(recordedData, data);
       recordedSteps.push(...steps);
-      log.info(`activate: restored recording — ${Object.keys(data).length} field(s), ${steps.length} step(s)`);
+      log.info(`recording restore: ✅ restored — ${Object.keys(data).length} field(s), ${steps.length} step(s)`);
+    } else {
+      log.info(`recording restore: ⚠️ skipped — memory already has ${recordedSteps.length} step(s) (fresh recording in progress?)`);
     }
   }
-} catch { /* parse error or storage unavailable — ignore */ }
+} catch (e) { log.warn('recording restore: error reading localStorage —', e); }
 
 
 // ─── Step Recording ───────────────────────────────────────────────────────────
@@ -305,6 +321,29 @@ function handleStepClick(e) {
   recordedSteps.push({ type: 'click', tag, text, name, index });
   log.info('recorded click:', tag, name || text);
   persistRecordingState();
+
+  // Detect same-tab navigation after this click (e.g. Perfios redirect).
+  // Cancel any listener from a previous click first — only the LAST click that causes
+  // navigation should be marked expectsRedirect=true (avoids multi-flag bug).
+  if (pendingMarkRedirect) {
+    window.removeEventListener('beforeunload', pendingMarkRedirect);
+    pendingMarkRedirect = null;
+  }
+  const redirectStepIndex = recordedSteps.length - 1;
+  const markRedirect = () => {
+    pendingMarkRedirect = null;
+    if (recordedSteps[redirectStepIndex]?.type === 'click') {
+      recordedSteps[redirectStepIndex].expectsRedirect = true;
+      persistRecordingState();
+      log.info('recorded redirect: step', redirectStepIndex + 1, 'marked as expectsRedirect=true');
+    }
+  };
+  pendingMarkRedirect = markRedirect;
+  window.addEventListener('beforeunload', markRedirect, { once: true });
+  setTimeout(() => {
+    window.removeEventListener('beforeunload', markRedirect);
+    if (pendingMarkRedirect === markRedirect) pendingMarkRedirect = null;
+  }, 30_000);
 }
 
 document.addEventListener('change', handleStepChange, true);
@@ -410,18 +449,41 @@ function waitForElement(selector, timeout = 2000) {
   });
 }
 
-/** Polls indefinitely until a fill-step's input exists in the DOM */
+/** Polls until a fill-step's input exists in the DOM AND is visible on screen.
+ *  "Visible" means: not hidden via data-visible="false" AND has non-zero layout dimensions.
+ *  After 30s we fall back and return the element even if still hidden, to avoid hanging forever
+ *  on fields that are legitimately in a hidden-but-fillable state. */
 function waitForFillable(name) {
   const selector = `[name="${CSS.escape(name)}"]`;
+  const VISIBILITY_TIMEOUT_MS = 30_000;
+  const isVisible = el => {
+    if (isHidden(el)) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
   log.info(`waitForFillable: "${name}"`);
   return new Promise(resolve => {
     const start = Date.now();
     let lastLog = 0;
     const id = setInterval(() => {
-      if (!stepReplayActive) { clearInterval(id); return resolve(null); } // stopped by user
+      if (!stepReplayActive) { clearInterval(id); return resolve(null); }
       const el = document.querySelector(selector);
-      if (el) { clearInterval(id); log.info(`waitForFillable: ready "${name}" (hidden=${isHidden(el)})`); return resolve(el); }
       const elapsed = Date.now() - start;
+      if (el) {
+        if (isVisible(el)) {
+          clearInterval(id);
+          log.info(`waitForFillable: ready "${name}"`);
+          return resolve(el);
+        }
+        // Element exists but not yet visible — wait up to VISIBILITY_TIMEOUT_MS
+        if (elapsed >= VISIBILITY_TIMEOUT_MS) {
+          clearInterval(id);
+          log.warn(`waitForFillable: "${name}" still hidden/off-screen after 30s — filling anyway`);
+          return resolve(el);
+        }
+        if (elapsed - lastLog >= 2000) { lastLog = elapsed; log.info(`waitForFillable: "${name}" in DOM but not visible yet (${Math.round(elapsed/1000)}s) — waiting`); }
+        return;
+      }
       if (elapsed - lastLog >= 2000) { lastLog = elapsed; log.info(`waitForFillable: "${name}" not in DOM (${Math.round(elapsed/1000)}s)`); }
     }, 100);
   });
@@ -554,6 +616,17 @@ function waitForTabVisible() {
 async function replaySteps(steps, stopAfterIndex = -1) {
   log.info(`replaySteps: starting — ${steps.length} step(s)${stopAfterIndex >= 0 ? `, stop after step ${stopAfterIndex + 1}` : ''}`);
   console.log('[Recorder] replaySteps stopAfterIndex =', stopAfterIndex);
+
+  // If the page navigates mid-replay (e.g. same-tab Perfios redirect), stop immediately.
+  // SAVE_RESUME_STATE is saved before each click so FORM_READY can resume after the redirect.
+  let suspendedForNavigation = false;
+  const onNavigate = () => {
+    log.info('replaySteps: beforeunload — page navigating, suspending replay');
+    stepReplayActive = false;
+    suspendedForNavigation = true;
+  };
+  window.addEventListener('beforeunload', onNavigate, { once: true });
+
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     if (!stepReplayActive) { log.info('replaySteps: stopped'); break; }
@@ -565,6 +638,15 @@ async function replaySteps(steps, stopAfterIndex = -1) {
     }
 
     await waitForTabVisible();
+
+    // If the previous click triggered same-tab navigation (e.g. Perfios redirect),
+    // beforeunload fired and set stepReplayActive=false. Stop here — FORM_READY will resume.
+    if (!stepReplayActive) { log.info('replaySteps: navigation detected — suspending'); break; }
+
+    // We're executing step i — the previous step did NOT cause page navigation.
+    // Safe to clear any resume state that was saved for the previous click.
+    await chrome.runtime.sendMessage({ type: 'CLEAR_RESUME_STATE' }).catch(() => {});
+
     log.group(`Step ${i + 1}/${steps.length}: ${step.type} — ${step.name || step.text || ''}`);
 
     if (step.type === 'fill') {
@@ -704,6 +786,35 @@ async function replaySteps(steps, stopAfterIndex = -1) {
         log.info(`replay save: ⏳ saved state before click — will resume from step ${i + 2}/${steps.length} if page navigates (expectedPath=${window.location.pathname})`);
 
         let clicked = false;
+
+        if (step.expectsRedirect) {
+          // This click was recorded as causing a same-tab navigation (e.g. Perfios redirect).
+          // Fire once and wait for beforeunload — no need to guess from "button gone" heuristics.
+          // SAVE_RESUME_STATE is already saved; FORM_READY will resume after the redirect.
+          log.info('click: expectsRedirect=true — firing and waiting for page navigation (up to 30s)');
+          await chrome.runtime.sendMessage({ type: 'START_WATCHING_TAB' });
+          el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+          el.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true, cancelable: true, view: window }));
+          el.dispatchEvent(new MouseEvent('click',     { bubbles: true, cancelable: true, view: window }));
+          await waitForNetwork();
+
+          const navigated = await new Promise(resolve => {
+            const h = () => resolve(true);
+            window.addEventListener('beforeunload', h, { once: true });
+            setTimeout(() => { window.removeEventListener('beforeunload', h); resolve(false); }, 30_000);
+          });
+
+          if (navigated) {
+            log.info('click: navigation confirmed — suspending replay, FORM_READY will resume');
+            suspendedForNavigation = true;
+            stepReplayActive = false;
+          } else {
+            log.warn('click: navigation expected but did not happen after 30s — continuing normally');
+          }
+          clicked = true;
+          await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' });
+        } else {
+
         while (stepReplayActive && !clicked) {
           log.info('click: firing on', el);
           await chrome.runtime.sendMessage({ type: 'START_WATCHING_TAB' });
@@ -769,12 +880,14 @@ async function replaySteps(steps, stopAfterIndex = -1) {
             }
           }
         }
-        // Still on this page after click — tell background to drop the resume state
-        await chrome.runtime.sendMessage({ type: 'CLEAR_RESUME_STATE' });
-        log.info('replay save: ❌ no navigation detected — saved state cleared');
+        } // end else (normal click — not expectsRedirect)
+        // CLEAR_RESUME_STATE will be sent at the start of the next loop iteration.
       } else {
         log.warn('click: stopped before element found');
       }
+      // Note: CLEAR_RESUME_STATE is sent at the START of the next iteration,
+      // not here — this avoids the race where navigation triggers after "button gone"
+      // is detected but before we've sent the clear message.
     }
 
     log.end();
@@ -782,6 +895,14 @@ async function replaySteps(steps, stopAfterIndex = -1) {
       log.info('replaySteps: stop checkpoint reached at step', i + 1, '— pausing replay');
       break;
     }
+  }
+  window.removeEventListener('beforeunload', onNavigate);
+  if (!suspendedForNavigation) {
+    // Replay finished normally or was user-stopped — clear any lingering resume state.
+    // If navigating, preserve the state so FORM_READY can resume after the redirect.
+    await chrome.runtime.sendMessage({ type: 'CLEAR_RESUME_STATE' }).catch(() => {});
+  } else {
+    log.info('replaySteps: navigation in progress — preserving resume state for FORM_READY');
   }
   stepReplayActive = false;
   log.info('replaySteps: done');

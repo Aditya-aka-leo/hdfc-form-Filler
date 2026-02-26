@@ -90,16 +90,22 @@ async function handleMessage(message, sender) {
         return { resume: false };
       }
 
-      let currentPath;
-      try { const u = new URL(sender.tab.url); currentPath = u.origin + u.pathname; }
-      catch { currentPath = ''; }
+      // Compare origins only — after a redirect (e.g. Perfios) the form may advance
+      // to a new pathname. As long as we're back on the same domain, resume replay.
+      let currentOrigin;
+      try { currentOrigin = new URL(sender.tab.url).origin; }
+      catch { currentOrigin = ''; }
 
-      if (currentPath !== state.expectedPath) {
-        // Intermediate page (e.g. Perfios) — keep state, don't resume yet
-        return { resume: false };
+      let expectedOrigin;
+      try { expectedOrigin = new URL(state.expectedPath).origin; }
+      catch { expectedOrigin = ''; }
+
+      if (!currentOrigin || currentOrigin !== expectedOrigin) {
+        // Still on an intermediate domain (e.g. Perfios) — keep state, don't resume yet
+        return { resume: false, pendingState: true, expectedPath: state.expectedPath };
       }
 
-      // URL matches — hand state to content script and remove from storage
+      // Same origin — resume regardless of exact pathname (form may have advanced a step)
       await deleteResumeState(sender.tab.id);
       return { resume: true, steps: state.steps, resumeFromStep: state.resumeFromStep, stopAfterIndex: state.stopAfterIndex };
     }
