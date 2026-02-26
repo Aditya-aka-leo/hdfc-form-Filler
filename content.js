@@ -225,6 +225,26 @@ function activate() {
 document.addEventListener('input', handleInputChange, true);
 document.addEventListener('change', handleInputChange, true);
 
+// ─── Resume replay after same-tab redirect (e.g. Perfios) ────────────────────
+// Ask background if there is a pending resume state for this tab.
+// Background holds it in chrome.storage.session (survives SW restarts).
+// Intermediate pages (Perfios) get { resume: false } — state is preserved.
+chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
+  log.info('activate: FORM_READY →', JSON.stringify(response));
+  if (!response?.resume) return;
+
+  const { steps, resumeFromStep, stopAfterIndex } = response;
+  log.info(`activate: resuming replay from step ${resumeFromStep + 1}/${steps.length} (stopAfterIndex=${stopAfterIndex})`);
+  await new Promise(r => setTimeout(r, 2000));
+  stepReplayActive = true;
+  const slicedSteps = steps.slice(resumeFromStep);
+  const adjustedStop = stopAfterIndex >= resumeFromStep ? stopAfterIndex - resumeFromStep : -1;
+  replaySteps(slicedSteps, adjustedStop).catch(err => {
+    log.warn('activate: auto-resume error:', err);
+    stepReplayActive = false;
+  });
+}).catch(err => { log.warn('activate: FORM_READY failed:', err); });
+
 // ─── Restore recording state after same-tab navigation ───────────────────────
 // If the user was recording and the page navigated (e.g. to Perfios), the
 // in-memory recordedData/recordedSteps were wiped. Restore them here so the
