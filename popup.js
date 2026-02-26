@@ -207,39 +207,50 @@ async function copyFieldsToClipboard() {
 // ─── Field panel ─────────────────────────────────────────────────────────────
 
 let openPanelId = null;
-let openStepsPanelId = null;
 
 function enabledCount(session) {
   const excluded = new Set(session.excluded || []);
   return Object.keys(session.data).length - excluded.size;
 }
 
-function buildFieldPanel(session) {
-  const excluded = new Set(session.excluded || []);
-  const fields = Object.entries(session.data);
-
+function buildConfigPanel(session, savedStopAfterIndex) {
   const panel = document.createElement('div');
   panel.className = 'field-panel';
   panel.dataset.panelId = session.id;
 
-  const header = document.createElement('div');
-  header.className = 'field-panel-header';
-  header.innerHTML = `
+  // ── Tab bar ──────────────────────────────────────────────────────────────────
+  const tabBar = document.createElement('div');
+  tabBar.className = 'config-tab-bar';
+  const hasSteps = session.steps && session.steps.length > 0;
+  tabBar.innerHTML = `
+    <button class="config-tab config-tab-active" data-tab="fields">Fields</button>
+    ${hasSteps ? '<button class="config-tab" data-tab="steps">Steps</button>' : ''}
+  `;
+  panel.appendChild(tabBar);
+
+  // ── Fields pane ──────────────────────────────────────────────────────────────
+  const fieldsPane = document.createElement('div');
+  fieldsPane.dataset.pane = 'fields';
+
+  const excluded = new Set(session.excluded || []);
+  const fields = Object.entries(session.data);
+
+  const fieldHeader = document.createElement('div');
+  fieldHeader.className = 'field-panel-header';
+  fieldHeader.innerHTML = `
     <span class="field-panel-title">Fields</span>
     <span class="field-panel-count" id="panel-count-${session.id}">
       ${enabledCount(session)} of ${fields.length} will prefill
     </span>
   `;
-  panel.appendChild(header);
+  fieldsPane.appendChild(fieldHeader);
 
-  const list = document.createElement('div');
-  list.className = 'field-panel-list';
-
+  const fieldList = document.createElement('div');
+  fieldList.className = 'field-panel-list';
   fields.forEach(([key, val]) => {
     const isEnabled = !excluded.has(key);
     const row = document.createElement('div');
     row.className = 'field-row' + (isEnabled ? '' : ' field-row-disabled');
-
     row.innerHTML = `
       <div class="field-row-info">
         <span class="field-row-name">${fieldLabel(key)}</span>
@@ -250,109 +261,106 @@ function buildFieldPanel(session) {
         <span class="toggle-track"><span class="toggle-thumb"></span></span>
       </label>
     `;
-
     row.querySelector('input').addEventListener('change', async (e) => {
       row.classList.toggle('field-row-disabled', !e.target.checked);
       await toggleExclusion(session, key, e.target.checked);
     });
-
-    list.appendChild(row);
+    fieldList.appendChild(row);
   });
+  fieldsPane.appendChild(fieldList);
+  panel.appendChild(fieldsPane);
 
-  panel.appendChild(list);
-  return panel;
-}
+  // ── Steps pane ───────────────────────────────────────────────────────────────
+  if (hasSteps) {
+    const stepsPane = document.createElement('div');
+    stepsPane.dataset.pane = 'steps';
+    stepsPane.style.display = 'none';
 
-function buildStepsPanel(session, savedStopAfterIndex) {
-  const steps = session.steps || [];
-  const panel = document.createElement('div');
-  panel.className = 'steps-panel';
+    const stepsHeader = document.createElement('div');
+    stepsHeader.className = 'field-panel-header';
+    stepsHeader.innerHTML = `
+      <span class="field-panel-title">Checkpoints</span>
+      <span class="field-panel-count" id="stop-label-${session.id}">
+        ${savedStopAfterIndex >= 0 ? 'Stops at step ' + (savedStopAfterIndex + 1) : 'Runs all steps'}
+      </span>
+    `;
+    stepsPane.appendChild(stepsHeader);
 
-  const header = document.createElement('div');
-  header.className = 'field-panel-header';
-  header.innerHTML = `
-    <span class="field-panel-title">Step checkpoints</span>
-    <span class="field-panel-count" id="stop-label-${session.id}">
-      ${savedStopAfterIndex >= 0 ? 'Stops at step ' + (savedStopAfterIndex + 1) : 'Runs all steps'}
-    </span>
-  `;
-  panel.appendChild(header);
+    const stepList = document.createElement('div');
+    stepList.className = 'field-panel-list';
 
-  const list = document.createElement('div');
-  list.className = 'field-panel-list';
+    const hint = document.createElement('div');
+    hint.className = 'steps-hint';
+    hint.textContent = 'Select a button click to stop replay there. Click again to clear.';
+    stepList.appendChild(hint);
 
-  // Instruction hint
-  const hint = document.createElement('div');
-  hint.className = 'steps-hint';
-  hint.textContent = 'Select a button click to stop replay there. Click again to clear.';
-  list.appendChild(hint);
-
-  let selectedIdx = savedStopAfterIndex;
-  let fillCount = 0;
-
-  steps.forEach((step, i) => {
-    if (step.type === 'fill') {
-      fillCount++;
-    } else if (step.type === 'click') {
-      // Show accumulated fill count as a divider
-      if (fillCount > 0) {
-        const divider = document.createElement('div');
-        divider.className = 'step-fill-count';
-        divider.textContent = `${fillCount} field${fillCount !== 1 ? 's' : ''}`;
-        list.appendChild(divider);
-        fillCount = 0;
-      }
-
-      const isSelected = selectedIdx === i;
-      const row = document.createElement('div');
-      row.className = 'step-checkpoint-row' + (isSelected ? ' step-selected' : '');
-      row.dataset.stepIndex = i;
-
-      const label = step.text || step.name || 'Button';
-      row.innerHTML = `
-        <div class="step-radio ${isSelected ? 'step-radio-active' : ''}"></div>
-        <div class="step-checkpoint-info">
-          <span class="step-checkpoint-label">${label}</span>
-          <span class="step-tag">click</span>
-        </div>
-      `;
-
-      row.addEventListener('click', async () => {
-        const newIdx = selectedIdx === i ? -1 : i; // toggle off if same row
-        selectedIdx = newIdx;
-        await chrome.storage.local.set({ [`stopAfterStep_${session.id}`]: newIdx });
-
-        list.querySelectorAll('.step-checkpoint-row').forEach(r => {
-          const active = parseInt(r.dataset.stepIndex) === newIdx;
-          r.classList.toggle('step-selected', active);
-          r.querySelector('.step-radio').classList.toggle('step-radio-active', active);
+    let selectedIdx = savedStopAfterIndex;
+    let fillCount = 0;
+    session.steps.forEach((step, i) => {
+      if (step.type === 'fill') {
+        fillCount++;
+      } else if (step.type === 'click') {
+        if (fillCount > 0) {
+          const divider = document.createElement('div');
+          divider.className = 'step-fill-count';
+          divider.textContent = `${fillCount} field${fillCount !== 1 ? 's' : ''}`;
+          stepList.appendChild(divider);
+          fillCount = 0;
+        }
+        const isSelected = selectedIdx === i;
+        const row = document.createElement('div');
+        row.className = 'step-checkpoint-row' + (isSelected ? ' step-selected' : '');
+        row.dataset.stepIndex = i;
+        const label = step.text || step.name || 'Button';
+        row.innerHTML = `
+          <div class="step-radio ${isSelected ? 'step-radio-active' : ''}"></div>
+          <div class="step-checkpoint-info">
+            <span class="step-checkpoint-label">${label}</span>
+            <span class="step-tag">click</span>
+          </div>
+        `;
+        row.addEventListener('click', async () => {
+          const newIdx = selectedIdx === i ? -1 : i;
+          selectedIdx = newIdx;
+          await chrome.storage.local.set({ [`stopAfterStep_${session.id}`]: newIdx });
+          stepList.querySelectorAll('.step-checkpoint-row').forEach(r => {
+            const active = parseInt(r.dataset.stepIndex) === newIdx;
+            r.classList.toggle('step-selected', active);
+            r.querySelector('.step-radio').classList.toggle('step-radio-active', active);
+          });
+          const countEl = document.getElementById(`stop-label-${session.id}`);
+          if (countEl) countEl.textContent = newIdx >= 0 ? `Stops at step ${newIdx + 1}` : 'Runs all steps';
         });
-
-        const countEl = document.getElementById(`stop-label-${session.id}`);
-        if (countEl) countEl.textContent = newIdx >= 0 ? `Stops at step ${newIdx + 1}` : 'Runs all steps';
-      });
-
-      list.appendChild(row);
+        stepList.appendChild(row);
+      }
+    });
+    if (fillCount > 0) {
+      const divider = document.createElement('div');
+      divider.className = 'step-fill-count';
+      divider.textContent = `${fillCount} field${fillCount !== 1 ? 's' : ''} after last click`;
+      stepList.appendChild(divider);
     }
+    if (stepList.querySelectorAll('.step-checkpoint-row').length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'steps-hint';
+      empty.style.padding = '10px 12px';
+      empty.textContent = 'No button clicks recorded in this journey.';
+      stepList.appendChild(empty);
+    }
+    stepsPane.appendChild(stepList);
+    panel.appendChild(stepsPane);
+  }
+
+  // ── Tab switching ─────────────────────────────────────────────────────────────
+  tabBar.querySelectorAll('.config-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      tabBar.querySelectorAll('.config-tab').forEach(t => t.classList.remove('config-tab-active'));
+      tab.classList.add('config-tab-active');
+      panel.querySelectorAll('[data-pane]').forEach(p => { p.style.display = 'none'; });
+      panel.querySelector(`[data-pane="${tab.dataset.tab}"]`).style.display = '';
+    });
   });
 
-  // Remaining fills after the last click
-  if (fillCount > 0) {
-    const divider = document.createElement('div');
-    divider.className = 'step-fill-count';
-    divider.textContent = `${fillCount} field${fillCount !== 1 ? 's' : ''} after last click`;
-    list.appendChild(divider);
-  }
-
-  if (list.querySelectorAll('.step-checkpoint-row').length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'steps-hint';
-    empty.style.padding = '10px 12px';
-    empty.textContent = 'No button clicks recorded in this journey.';
-    list.appendChild(empty);
-  }
-
-  panel.appendChild(list);
   return panel;
 }
 
@@ -401,7 +409,6 @@ function renderList(sessions, pathname, deviceId) {
   sessions.forEach((session) => {
     const isActive = activeReplayId === session.id;
     const isPanelOpen = openPanelId === session.id;
-    const isStepsPanelOpen = openStepsPanelId === session.id;
     const isOwn = session.createdBy === deviceId;
     const isLocal = !!session._local;
 
@@ -436,7 +443,7 @@ function renderList(sessions, pathname, deviceId) {
     // Configure button
     const btnConfigure = document.createElement('button');
     btnConfigure.className = 'btn btn-ghost btn-sm btn-icon' + (isPanelOpen ? ' btn-active' : '');
-    btnConfigure.title = 'Configure fields';
+    btnConfigure.title = 'Configure fields & steps';
     btnConfigure.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/>
       <line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/>
@@ -444,17 +451,17 @@ function renderList(sessions, pathname, deviceId) {
       <line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/>
       <line x1="17" y1="16" x2="23" y2="16"/>
     </svg>`;
-    btnConfigure.addEventListener('click', () => {
-      document.querySelectorAll('.field-panel, .steps-panel').forEach(p => p.remove());
+    btnConfigure.addEventListener('click', async () => {
+      document.querySelectorAll('.field-panel').forEach(p => p.remove());
       document.querySelectorAll('.btn-active').forEach(b => b.classList.remove('btn-active'));
-      openStepsPanelId = null;
 
       if (openPanelId === session.id) {
         openPanelId = null;
       } else {
         openPanelId = session.id;
         btnConfigure.classList.add('btn-active');
-        const panel = buildFieldPanel(session);
+        const { [`stopAfterStep_${session.id}`]: saved } = await chrome.storage.local.get(`stopAfterStep_${session.id}`);
+        const panel = buildConfigPanel(session, saved ?? -1);
         item.insertAdjacentElement('afterend', panel);
       }
     });
@@ -480,27 +487,6 @@ function renderList(sessions, pathname, deviceId) {
       btnReplay.addEventListener('click', () => startReplay(session, pathname, deviceId, 'steps'));
       actions.appendChild(btnReplay);
 
-      // Steps checkpoint button
-      const btnSteps = document.createElement('button');
-      btnSteps.className = 'btn btn-ghost btn-sm btn-icon' + (isStepsPanelOpen ? ' btn-active' : '');
-      btnSteps.title = 'Configure replay checkpoint';
-      btnSteps.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="3" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="3" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="3" cy="18" r="1" fill="currentColor" stroke="none"/></svg>`;
-      btnSteps.addEventListener('click', async () => {
-        document.querySelectorAll('.field-panel, .steps-panel').forEach(p => p.remove());
-        document.querySelectorAll('.btn-active').forEach(b => b.classList.remove('btn-active'));
-        openPanelId = null;
-
-        if (openStepsPanelId === session.id) {
-          openStepsPanelId = null;
-        } else {
-          openStepsPanelId = session.id;
-          btnSteps.classList.add('btn-active');
-          const { [`stopAfterStep_${session.id}`]: saved } = await chrome.storage.local.get(`stopAfterStep_${session.id}`);
-          const panel = buildStepsPanel(session, saved ?? -1);
-          item.insertAdjacentElement('afterend', panel);
-        }
-      });
-      actions.appendChild(btnSteps);
     }
 
     // Prefill Data button — always available
@@ -526,14 +512,9 @@ function renderList(sessions, pathname, deviceId) {
     list.appendChild(item);
 
     if (isPanelOpen) {
-      const panel = buildFieldPanel(session);
-      list.appendChild(panel);
-    }
-
-    if (isStepsPanelOpen) {
       (async () => {
         const { [`stopAfterStep_${session.id}`]: saved } = await chrome.storage.local.get(`stopAfterStep_${session.id}`);
-        const panel = buildStepsPanel(session, saved ?? -1);
+        const panel = buildConfigPanel(session, saved ?? -1);
         item.insertAdjacentElement('afterend', panel);
       })();
     }
