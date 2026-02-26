@@ -573,6 +573,10 @@ async function saveJourney(pathname, deviceId) {
     steps = stepsResponse.steps || [];
   } catch { /* ignore */ }
 
+  // Clear persisted recording state so a subsequent fresh recording on the same
+  // URL doesn't accidentally restore this journey's data.
+  chrome.tabs.sendMessage(tab.id, { type: 'CLEAR_RECORDING_STATE' }).catch(() => {});
+
   // Toggle OFF → save locally only, no DB. User can share later via the Share button.
   if (!shareWithTeam) {
     const localSession = { ...session, steps, _local: true };

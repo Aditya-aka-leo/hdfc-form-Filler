@@ -6,30 +6,108 @@ const watch = {
   watchedTabId: null,
 };
 
+// ─── Per-tab replay resume state ──────────────────────────────────────────────
+// Persisted in chrome.storage.session so it survives MV3 service-worker restarts
+// (the worker can be killed after ~30s of inactivity — Perfios takes minutes).
+// Only background.js reads/writes this key; content scripts never touch it.
+
+const SESSION_KEY = 'bgResumeStates'; // { [tabId]: { steps, resumeFromStep, stopAfterIndex, expectedPath, savedAt } }
+
+async function getResumeState(tabId) {
+  const result = await chrome.storage.session.get(SESSION_KEY).catch(() => ({}));
+  return (result[SESSION_KEY] || {})[tabId] ?? null;
+}
+
+async function setResumeState(tabId, state) {
+  const result = await chrome.storage.session.get(SESSION_KEY).catch(() => ({}));
+  const all = result[SESSION_KEY] || {};
+  all[tabId] = state;
+  await chrome.storage.session.set({ [SESSION_KEY]: all }).catch(() => {});
+}
+
+async function deleteResumeState(tabId) {
+  const result = await chrome.storage.session.get(SESSION_KEY).catch(() => ({}));
+  const all = result[SESSION_KEY] || {};
+  delete all[tabId];
+  await chrome.storage.session.set({ [SESSION_KEY]: all }).catch(() => {});
+}
+
 // ─── Messages from content script ────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  handleMessage(message, sender).then(sendResponse).catch(() => sendResponse({ ok: false }));
+  return true; // keep channel open for async response
+});
+
+async function handleMessage(message, sender) {
   switch (message.type) {
+
     case 'START_WATCHING_TAB':
       watch.active = true;
       watch.resumeTabId = sender.tab.id;
       watch.watchedTabId = null;
-      sendResponse({ ok: true });
-      break;
+      return { ok: true };
 
     case 'STOP_WATCHING_TAB':
       watch.active = false;
       watch.resumeTabId = null;
       watch.watchedTabId = null;
-      sendResponse({ ok: true });
-      break;
+      return { ok: true };
 
     case 'GET_WATCH_STATE':
-      sendResponse({ watchedTabId: watch.watchedTabId });
-      break;
+      return { watchedTabId: watch.watchedTabId };
+
+    // Content script calls this before firing a click that may navigate the page.
+    // State is written to chrome.storage.session so it survives service-worker restarts.
+    case 'SAVE_RESUME_STATE': {
+      const state = {
+        steps:          message.steps,
+        resumeFromStep: message.resumeFromStep,
+        stopAfterIndex: message.stopAfterIndex,
+        expectedPath:   message.expectedPath,
+        savedAt:        Date.now(),
+      };
+      await setResumeState(sender.tab.id, state);
+      return { ok: true };
+    }
+
+    // Content script calls this after a click that did NOT navigate the page.
+    case 'CLEAR_RESUME_STATE': {
+      await deleteResumeState(sender.tab.id);
+      return { ok: true };
+    }
+
+    // Called by content script in activate() on every page load.
+    // Background checks storage for a pending resume state for this tab.
+    // Intermediate pages (Perfios etc.) get { resume: false } — state is preserved.
+    case 'FORM_READY': {
+      const state = await getResumeState(sender.tab.id);
+      if (!state) return { resume: false };
+
+      const expired = Date.now() - state.savedAt > 10 * 60 * 1000;
+      if (expired) {
+        await deleteResumeState(sender.tab.id);
+        return { resume: false };
+      }
+
+      let currentPath;
+      try { const u = new URL(sender.tab.url); currentPath = u.origin + u.pathname; }
+      catch { currentPath = ''; }
+
+      if (currentPath !== state.expectedPath) {
+        // Intermediate page (e.g. Perfios) — keep state, don't resume yet
+        return { resume: false };
+      }
+
+      // URL matches — hand state to content script and remove from storage
+      await deleteResumeState(sender.tab.id);
+      return { resume: true, steps: state.steps, resumeFromStep: state.resumeFromStep, stopAfterIndex: state.stopAfterIndex };
+    }
+
+    default:
+      return { ok: false, error: 'Unknown message type' };
   }
-  return true;
-});
+}
 
 // ─── Tab lifecycle ────────────────────────────────────────────────────────────
 
