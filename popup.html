@@ -782,6 +782,21 @@
     </div>
   </div>
 
+  <!-- URL filter card -->
+  <div class="card">
+    <div class="card-header">Allowed URLs</div>
+    <div style="padding: 0 10px 4px; display: flex; gap: 6px;">
+      <div class="input-wrap">
+        <input type="text" id="urlPatternInput" placeholder="e.g. https://example.com/form/" />
+      </div>
+      <button class="btn btn-ghost" id="btnAddUrl" style="flex-shrink:0;">Add</button>
+    </div>
+    <div id="urlPatternList" style="padding: 0 10px 8px; display: flex; flex-direction: column; gap: 4px;"></div>
+    <div style="padding: 0 12px 8px; font-size: 10px; color: var(--text-3);">
+      Leave empty to run on all pages.
+    </div>
+  </div>
+
   <div id="statusBar"></div>
 
 </div>

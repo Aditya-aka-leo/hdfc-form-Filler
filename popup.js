@@ -617,6 +617,48 @@ async function init() {
   const sessions = await loadSessions(pathname);
   renderList(sessions, pathname, deviceId);
 
+  // ── URL pattern management ──────────────────────────────────────────────────
+  let allowedPatterns = [];
+
+  const renderPatterns = () => {
+    const list = document.getElementById('urlPatternList');
+    list.innerHTML = '';
+    allowedPatterns.forEach((p, i) => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:6px;';
+      row.innerHTML = `
+        <span style="flex:1;font-size:11px;color:var(--text);font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${p}">${p}</span>
+        <button class="btn btn-danger-ghost btn-sm" data-i="${i}" style="flex-shrink:0;padding:3px 7px;">✕</button>
+      `;
+      row.querySelector('button').addEventListener('click', async () => {
+        allowedPatterns.splice(i, 1);
+        await chrome.storage.local.set({ allowedPatterns });
+        renderPatterns();
+      });
+      list.appendChild(row);
+    });
+  };
+
+  const { allowedPatterns: stored } = await chrome.storage.local.get('allowedPatterns');
+  allowedPatterns = stored || [];
+  renderPatterns();
+
+  document.getElementById('btnAddUrl').addEventListener('click', async () => {
+    const input = document.getElementById('urlPatternInput');
+    const val = input.value.trim();
+    if (!val) return;
+    if (!allowedPatterns.includes(val)) {
+      allowedPatterns.push(val);
+      await chrome.storage.local.set({ allowedPatterns });
+      renderPatterns();
+    }
+    input.value = '';
+  });
+
+  document.getElementById('urlPatternInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') document.getElementById('btnAddUrl').click();
+  });
+
   document.getElementById('btnSave').addEventListener('click', () => saveJourney(pathname, deviceId));
 
   document.getElementById('journeyName').addEventListener('keydown', (e) => {

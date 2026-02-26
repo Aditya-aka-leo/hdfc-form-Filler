@@ -191,6 +191,19 @@ function handleInputChange(e) {
   }
 }
 
+// ─── Activation Guard ────────────────────────────────────────────────────────
+// Only attach listeners and intercept network if current page matches allowed patterns.
+// If no patterns are configured, activate everywhere (default behaviour).
+chrome.storage.local.get('allowedPatterns').then(({ allowedPatterns }) => {
+  if (allowedPatterns && allowedPatterns.length > 0) {
+    const href = window.location.href;
+    const allowed = allowedPatterns.some(p => href.startsWith(p.replace(/\*$/, '')));
+    if (!allowed) { log.info('Skipping — page not in allowed URL list'); return; }
+  }
+  activate();
+});
+
+function activate() {
 document.addEventListener('input', handleInputChange, true);
 document.addEventListener('change', handleInputChange, true);
 
@@ -698,3 +711,4 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   return true;
 });
+} // end activate()
