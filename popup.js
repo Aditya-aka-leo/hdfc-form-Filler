@@ -213,7 +213,7 @@ function enabledCount(session) {
   return Object.keys(session.data).length - excluded.size;
 }
 
-function buildConfigPanel(session, savedStopAfterIndex) {
+function buildConfigPanel(session, savedStopAfterIndex, isAutoReplay = false) {
   const panel = document.createElement('div');
   panel.className = 'field-panel';
   panel.dataset.panelId = session.id;
@@ -288,6 +288,37 @@ function buildConfigPanel(session, savedStopAfterIndex) {
 
     const stepList = document.createElement('div');
     stepList.className = 'field-panel-list';
+
+    // Auto-replay toggle — starts this journey automatically when the page opens
+    const autoReplayRow = document.createElement('div');
+    autoReplayRow.className = 'auto-replay-row';
+    autoReplayRow.innerHTML = `
+      <div class="auto-replay-info">
+        <span class="auto-replay-label">Auto-replay on open</span>
+        <span class="auto-replay-hint">Starts automatically when this page opens in a new tab</span>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="auto-replay-${session.id}" ${isAutoReplay ? 'checked' : ''} />
+        <span class="toggle-track"><span class="toggle-thumb"></span></span>
+      </label>
+    `;
+    autoReplayRow.querySelector('input').addEventListener('change', async (e) => {
+      const { autoReplayJourneys = {} } = await chrome.storage.local.get('autoReplayJourneys');
+      if (e.target.checked) {
+        autoReplayJourneys[session.pathname] = {
+          id: session.id, label: session.label,
+          steps: session.steps, data: session.data,
+        };
+        setStatus(`Auto-replay enabled for "${session.label}"`, 'success');
+      } else {
+        if (autoReplayJourneys[session.pathname]?.id === session.id) {
+          delete autoReplayJourneys[session.pathname];
+        }
+        setStatus('Auto-replay disabled.', 'default');
+      }
+      await chrome.storage.local.set({ autoReplayJourneys });
+    });
+    stepsPane.appendChild(autoReplayRow);
 
     const hint = document.createElement('div');
     hint.className = 'steps-hint';
@@ -460,8 +491,9 @@ function renderList(sessions, pathname, deviceId) {
       } else {
         openPanelId = session.id;
         btnConfigure.classList.add('btn-active');
-        const { [`stopAfterStep_${session.id}`]: saved } = await chrome.storage.local.get(`stopAfterStep_${session.id}`);
-        const panel = buildConfigPanel(session, saved ?? -1);
+        const { [`stopAfterStep_${session.id}`]: saved, autoReplayJourneys } = await chrome.storage.local.get([`stopAfterStep_${session.id}`, 'autoReplayJourneys']);
+        const isAutoReplay = autoReplayJourneys?.[session.pathname]?.id === session.id;
+        const panel = buildConfigPanel(session, saved ?? -1, isAutoReplay);
         item.insertAdjacentElement('afterend', panel);
       }
     });
@@ -513,8 +545,9 @@ function renderList(sessions, pathname, deviceId) {
 
     if (isPanelOpen) {
       (async () => {
-        const { [`stopAfterStep_${session.id}`]: saved } = await chrome.storage.local.get(`stopAfterStep_${session.id}`);
-        const panel = buildConfigPanel(session, saved ?? -1);
+        const { [`stopAfterStep_${session.id}`]: saved, autoReplayJourneys } = await chrome.storage.local.get([`stopAfterStep_${session.id}`, 'autoReplayJourneys']);
+        const isAutoReplay = autoReplayJourneys?.[session.pathname]?.id === session.id;
+        const panel = buildConfigPanel(session, saved ?? -1, isAutoReplay);
         item.insertAdjacentElement('afterend', panel);
       })();
     }

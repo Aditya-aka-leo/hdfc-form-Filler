@@ -235,8 +235,27 @@ chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
   if (!response?.resume) {
     if (response?.pendingState) {
       log.info(`replay restore: ⏸ pending state found but still on intermediate domain — waiting to resume at ${response.expectedPath}`);
-    } else {
-      log.info('replay restore: no pending state for this page');
+      return; // intermediate page (e.g. Perfios) — don't auto-replay here
+    }
+    log.info('replay restore: no pending state for this page');
+
+    // ── Auto-replay for customer/secondary forms ──────────────────────────────
+    // If this page has a journey configured for auto-replay (set via the popup's
+    // Steps tab), start it automatically. Designed for the customer form tab that
+    // opens from the RM page — QA/dev doesn't need to manually trigger replay.
+    const { autoReplayJourneys } = await chrome.storage.local.get('autoReplayJourneys');
+    const journey = autoReplayJourneys?.[window.location.pathname];
+    if (journey?.steps?.length) {
+      log.info(`auto-replay: journey "${journey.label}" configured for this page — starting`);
+      await new Promise(r => setTimeout(r, 1000));
+      await waitForNetwork();
+      log.info('auto-replay: network idle — starting replay');
+      await new Promise(r => setTimeout(r, 500));
+      stepReplayActive = true;
+      replaySteps(journey.steps).catch(err => {
+        log.warn('auto-replay: error —', err);
+        stepReplayActive = false;
+      });
     }
     return;
   }
