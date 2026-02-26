@@ -230,20 +230,22 @@ document.addEventListener('change', handleInputChange, true);
 // Background holds it in chrome.storage.session (survives SW restarts).
 // Intermediate pages (Perfios) get { resume: false } — state is preserved.
 chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
-  log.info('activate: FORM_READY →', JSON.stringify(response));
-  if (!response?.resume) return;
-
+  if (!response?.resume) {
+    log.info('replay restore: no pending state for this page (intermediate page or no redirect)');
+    return;
+  }
   const { steps, resumeFromStep, stopAfterIndex } = response;
-  log.info(`activate: resuming replay from step ${resumeFromStep + 1}/${steps.length} (stopAfterIndex=${stopAfterIndex})`);
+  log.info(`replay restore: ✅ state found — resuming from step ${resumeFromStep + 1}/${steps.length}, stopAfter=${stopAfterIndex}, url=${window.location.pathname}`);
   await new Promise(r => setTimeout(r, 2000));
   stepReplayActive = true;
   const slicedSteps = steps.slice(resumeFromStep);
   const adjustedStop = stopAfterIndex >= resumeFromStep ? stopAfterIndex - resumeFromStep : -1;
+  log.info(`replay restore: starting replaySteps with ${slicedSteps.length} remaining step(s), adjustedStop=${adjustedStop}`);
   replaySteps(slicedSteps, adjustedStop).catch(err => {
-    log.warn('activate: auto-resume error:', err);
+    log.warn('replay restore: error —', err);
     stepReplayActive = false;
   });
-}).catch(err => { log.warn('activate: FORM_READY failed:', err); });
+}).catch(err => { log.warn('replay restore: FORM_READY message failed —', err); });
 
 // ─── Restore recording state after same-tab navigation ───────────────────────
 // If the user was recording and the page navigated (e.g. to Perfios), the
@@ -699,7 +701,7 @@ async function replaySteps(steps, stopAfterIndex = -1) {
           stopAfterIndex,
           expectedPath: window.location.origin + window.location.pathname,
         });
-        log.info(`click: resume state saved in background — will resume from step ${i + 2}/${steps.length} if page navigates`);
+        log.info(`replay save: ⏳ saved state before click — will resume from step ${i + 2}/${steps.length} if page navigates (expectedPath=${window.location.pathname})`);
 
         let clicked = false;
         while (stepReplayActive && !clicked) {
@@ -769,7 +771,7 @@ async function replaySteps(steps, stopAfterIndex = -1) {
         }
         // Still on this page after click — tell background to drop the resume state
         await chrome.runtime.sendMessage({ type: 'CLEAR_RESUME_STATE' });
-        log.info('click: no navigation detected — resume state cleared');
+        log.info('replay save: ❌ no navigation detected — saved state cleared');
       } else {
         log.warn('click: stopped before element found');
       }
