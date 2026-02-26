@@ -482,8 +482,8 @@ function waitForTabVisible() {
   });
 }
 
-async function replaySteps(steps) {
-  log.info(`replaySteps: starting — ${steps.length} step(s)`);
+async function replaySteps(steps, stopAfterIndex = -1) {
+  log.info(`replaySteps: starting — ${steps.length} step(s)${stopAfterIndex >= 0 ? `, stop after step ${stopAfterIndex + 1}` : ''}`);
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     if (!stepReplayActive) { log.info('replaySteps: stopped'); break; }
@@ -660,6 +660,10 @@ async function replaySteps(steps) {
     }
 
     log.end();
+    if (stopAfterIndex >= 0 && i >= stopAfterIndex) {
+      log.info('replaySteps: stop checkpoint reached at step', i + 1, '— pausing replay');
+      break;
+    }
   }
   stepReplayActive = false;
   log.info('replaySteps: done');
@@ -697,7 +701,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     case 'START_STEP_REPLAY': {
       log.info('START_STEP_REPLAY:', message.steps.length, 'step(s)');
       stepReplayActive = true;
-      replaySteps(message.steps).catch((err) => { log.warn('replaySteps error:', err); stepReplayActive = false; });
+      replaySteps(message.steps, message.stopAfterIndex ?? -1).catch((err) => { log.warn('replaySteps error:', err); stepReplayActive = false; });
       sendResponse({ ok: true });
       break;
     }

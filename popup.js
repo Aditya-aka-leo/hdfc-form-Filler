@@ -207,6 +207,7 @@ async function copyFieldsToClipboard() {
 // ─── Field panel ─────────────────────────────────────────────────────────────
 
 let openPanelId = null;
+let openStepsPanelId = null;
 
 function enabledCount(session) {
   const excluded = new Set(session.excluded || []);
@@ -262,6 +263,99 @@ function buildFieldPanel(session) {
   return panel;
 }
 
+function buildStepsPanel(session, savedStopAfterIndex) {
+  const steps = session.steps || [];
+  const panel = document.createElement('div');
+  panel.className = 'steps-panel';
+
+  const header = document.createElement('div');
+  header.className = 'field-panel-header';
+  header.innerHTML = `
+    <span class="field-panel-title">Step checkpoints</span>
+    <span class="field-panel-count" id="stop-label-${session.id}">
+      ${savedStopAfterIndex >= 0 ? 'Stops at step ' + (savedStopAfterIndex + 1) : 'Runs all steps'}
+    </span>
+  `;
+  panel.appendChild(header);
+
+  const list = document.createElement('div');
+  list.className = 'field-panel-list';
+
+  // Instruction hint
+  const hint = document.createElement('div');
+  hint.className = 'steps-hint';
+  hint.textContent = 'Select a button click to stop replay there. Click again to clear.';
+  list.appendChild(hint);
+
+  let selectedIdx = savedStopAfterIndex;
+  let fillCount = 0;
+
+  steps.forEach((step, i) => {
+    if (step.type === 'fill') {
+      fillCount++;
+    } else if (step.type === 'click') {
+      // Show accumulated fill count as a divider
+      if (fillCount > 0) {
+        const divider = document.createElement('div');
+        divider.className = 'step-fill-count';
+        divider.textContent = `${fillCount} field${fillCount !== 1 ? 's' : ''}`;
+        list.appendChild(divider);
+        fillCount = 0;
+      }
+
+      const isSelected = selectedIdx === i;
+      const row = document.createElement('div');
+      row.className = 'step-checkpoint-row' + (isSelected ? ' step-selected' : '');
+      row.dataset.stepIndex = i;
+
+      const label = step.text || step.name || 'Button';
+      row.innerHTML = `
+        <div class="step-radio ${isSelected ? 'step-radio-active' : ''}"></div>
+        <div class="step-checkpoint-info">
+          <span class="step-checkpoint-label">${label}</span>
+          <span class="step-tag">click</span>
+        </div>
+      `;
+
+      row.addEventListener('click', async () => {
+        const newIdx = selectedIdx === i ? -1 : i; // toggle off if same row
+        selectedIdx = newIdx;
+        await chrome.storage.local.set({ [`stopAfterStep_${session.id}`]: newIdx });
+
+        list.querySelectorAll('.step-checkpoint-row').forEach(r => {
+          const active = parseInt(r.dataset.stepIndex) === newIdx;
+          r.classList.toggle('step-selected', active);
+          r.querySelector('.step-radio').classList.toggle('step-radio-active', active);
+        });
+
+        const countEl = document.getElementById(`stop-label-${session.id}`);
+        if (countEl) countEl.textContent = newIdx >= 0 ? `Stops at step ${newIdx + 1}` : 'Runs all steps';
+      });
+
+      list.appendChild(row);
+    }
+  });
+
+  // Remaining fills after the last click
+  if (fillCount > 0) {
+    const divider = document.createElement('div');
+    divider.className = 'step-fill-count';
+    divider.textContent = `${fillCount} field${fillCount !== 1 ? 's' : ''} after last click`;
+    list.appendChild(divider);
+  }
+
+  if (list.querySelectorAll('.step-checkpoint-row').length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'steps-hint';
+    empty.style.padding = '10px 12px';
+    empty.textContent = 'No button clicks recorded in this journey.';
+    list.appendChild(empty);
+  }
+
+  panel.appendChild(list);
+  return panel;
+}
+
 async function toggleExclusion(session, fieldName, isEnabled) {
   if (!session.excluded) session.excluded = [];
 
@@ -307,6 +401,7 @@ function renderList(sessions, pathname, deviceId) {
   sessions.forEach((session) => {
     const isActive = activeReplayId === session.id;
     const isPanelOpen = openPanelId === session.id;
+    const isStepsPanelOpen = openStepsPanelId === session.id;
     const isOwn = session.createdBy === deviceId;
     const isLocal = !!session._local;
 
@@ -350,8 +445,9 @@ function renderList(sessions, pathname, deviceId) {
       <line x1="17" y1="16" x2="23" y2="16"/>
     </svg>`;
     btnConfigure.addEventListener('click', () => {
-      document.querySelectorAll('.field-panel').forEach(p => p.remove());
+      document.querySelectorAll('.field-panel, .steps-panel').forEach(p => p.remove());
       document.querySelectorAll('.btn-active').forEach(b => b.classList.remove('btn-active'));
+      openStepsPanelId = null;
 
       if (openPanelId === session.id) {
         openPanelId = null;
@@ -383,6 +479,28 @@ function renderList(sessions, pathname, deviceId) {
       btnReplay.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="width:11px;height:11px"><polygon points="5 3 19 12 5 21 5 3" fill="currentColor" stroke="none"/></svg> Replay`;
       btnReplay.addEventListener('click', () => startReplay(session, pathname, deviceId, 'steps'));
       actions.appendChild(btnReplay);
+
+      // Steps checkpoint button
+      const btnSteps = document.createElement('button');
+      btnSteps.className = 'btn btn-ghost btn-sm btn-icon' + (isStepsPanelOpen ? ' btn-active' : '');
+      btnSteps.title = 'Configure replay checkpoint';
+      btnSteps.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="3" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="3" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="3" cy="18" r="1" fill="currentColor" stroke="none"/></svg>`;
+      btnSteps.addEventListener('click', async () => {
+        document.querySelectorAll('.field-panel, .steps-panel').forEach(p => p.remove());
+        document.querySelectorAll('.btn-active').forEach(b => b.classList.remove('btn-active'));
+        openPanelId = null;
+
+        if (openStepsPanelId === session.id) {
+          openStepsPanelId = null;
+        } else {
+          openStepsPanelId = session.id;
+          btnSteps.classList.add('btn-active');
+          const { [`stopAfterStep_${session.id}`]: saved } = await chrome.storage.local.get(`stopAfterStep_${session.id}`);
+          const panel = buildStepsPanel(session, saved ?? -1);
+          item.insertAdjacentElement('afterend', panel);
+        }
+      });
+      actions.appendChild(btnSteps);
     }
 
     // Prefill Data button — always available
@@ -410,6 +528,14 @@ function renderList(sessions, pathname, deviceId) {
     if (isPanelOpen) {
       const panel = buildFieldPanel(session);
       list.appendChild(panel);
+    }
+
+    if (isStepsPanelOpen) {
+      (async () => {
+        const { [`stopAfterStep_${session.id}`]: saved } = await chrome.storage.local.get(`stopAfterStep_${session.id}`);
+        const panel = buildStepsPanel(session, saved ?? -1);
+        item.insertAdjacentElement('afterend', panel);
+      })();
     }
   });
 }
@@ -504,9 +630,15 @@ async function startReplay(session, pathname, deviceId, mode = 'prefill') {
   const tab = await getTab();
   try {
     if (mode === 'steps' && session.steps && session.steps.length > 0) {
-      await chrome.tabs.sendMessage(tab.id, { type: 'START_STEP_REPLAY', steps: session.steps });
+      const { [`stopAfterStep_${session.id}`]: stopAfterIndex } = await chrome.storage.local.get(`stopAfterStep_${session.id}`);
+      await chrome.tabs.sendMessage(tab.id, {
+        type: 'START_STEP_REPLAY',
+        steps: session.steps,
+        stopAfterIndex: stopAfterIndex ?? -1,
+      });
       setActiveReplay(session);
-      setStatus(`Replay started — ${session.steps.length} steps.`, 'success');
+      const stopMsg = (stopAfterIndex ?? -1) >= 0 ? ` (stops at step ${stopAfterIndex + 1})` : '';
+      setStatus(`Replay started — ${session.steps.length} steps${stopMsg}.`, 'success');
     } else {
       const excluded = new Set(session.excluded || []);
       const filteredData = Object.fromEntries(
