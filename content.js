@@ -207,6 +207,34 @@ function activate() {
 document.addEventListener('input', handleInputChange, true);
 document.addEventListener('change', handleInputChange, true);
 
+// ─── Resume after same-tab redirect ──────────────────────────────────────────
+// If a previous replay click triggered a same-tab navigation, the content
+// script was destroyed mid-replay. On the next page load we resume from where
+// we left off, provided the URL matches and the state is less than 10 minutes old.
+chrome.storage.local.get('pendingResumeState').then(async ({ pendingResumeState }) => {
+  if (!pendingResumeState) return;
+  const { originPath, steps, resumeFromStep, stopAfterIndex, savedAt } = pendingResumeState;
+  const currentPath = window.location.origin + window.location.pathname;
+  const expired = Date.now() - savedAt > 10 * 60 * 1000;
+  if (!expired && currentPath === originPath) {
+    await chrome.storage.local.remove('pendingResumeState');
+    log.info(`Auto-resuming replay from step ${resumeFromStep + 1}/${steps.length} after redirect`);
+    await new Promise(r => setTimeout(r, 2000)); // let the page fully settle
+    stepReplayActive = true;
+    const slicedSteps = steps.slice(resumeFromStep);
+    const adjustedStop = stopAfterIndex >= resumeFromStep ? stopAfterIndex - resumeFromStep : -1;
+    replaySteps(slicedSteps, adjustedStop).catch(err => {
+      log.warn('auto-resume error:', err);
+      stepReplayActive = false;
+    });
+  } else {
+    // Stale or different URL — discard
+    await chrome.storage.local.remove('pendingResumeState');
+    log.info('pendingResumeState discarded (expired or wrong URL)');
+  }
+});
+
+
 // ─── Step Recording ───────────────────────────────────────────────────────────
 
 function handleStepChange(e) {
@@ -611,6 +639,19 @@ async function replaySteps(steps, stopAfterIndex = -1) {
         await waitForNetwork();
         await new Promise(r => setTimeout(r, 300));
 
+        // Persist resume state BEFORE clicking — if this click triggers a same-tab
+        // redirect (not a new tab), the content script will be destroyed. The state
+        // survives in storage and is picked up when the page loads again.
+        await chrome.storage.local.set({
+          pendingResumeState: {
+            steps,
+            resumeFromStep: i + 1,
+            stopAfterIndex,
+            originPath: window.location.origin + window.location.pathname,
+            savedAt: Date.now(),
+          }
+        });
+
         let clicked = false;
         while (stepReplayActive && !clicked) {
           log.info('click: firing on', el);
@@ -661,6 +702,8 @@ async function replaySteps(steps, stopAfterIndex = -1) {
             }
           }
         }
+        // Still on this page after click — clear the resume checkpoint
+        await chrome.storage.local.remove('pendingResumeState');
       } else {
         log.warn('click: stopped before element found');
       }
