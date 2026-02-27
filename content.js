@@ -228,6 +228,13 @@ function restoreRecordingStateSync() {
   try {
     const raw = window.localStorage.getItem(LS_KEY);
     if (!raw) return;
+    // On a hard reload, clear saved state — only restore on redirect/navigation
+    const navType = performance.getEntriesByType('navigation')[0]?.type;
+    if (navType === 'reload') {
+      window.localStorage.removeItem(LS_KEY);
+      log.info('recording restore: page reloaded — cleared state');
+      return;
+    }
     const { data, steps, savedAt } = JSON.parse(raw);
     const expired = Date.now() - savedAt > 2 * 60 * 60 * 1000; // 2 hours
     if (expired) {
@@ -241,8 +248,8 @@ function restoreRecordingStateSync() {
       recordedSteps.push(...steps);
       log.info(`recording restore: ✅ restored — ${Object.keys(data).length} field(s), ${steps.length} step(s) (before listeners attached)`);
     }
-  } catch (e) { 
-    log.warn('recording restore: error reading localStorage —', e); 
+  } catch (e) {
+    log.warn('recording restore: error reading localStorage —', e);
   }
 }
 
