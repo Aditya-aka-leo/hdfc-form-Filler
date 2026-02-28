@@ -7,6 +7,8 @@ let fillInProgress = false;
 let pendingFill = false;
 let activeRequests = 0;
 let stepReplayActive = false;
+let isChildRecordingTab = false; // true when this tab is a child being recorded
+let isChildReplayTab   = false; // true when this tab is a child being replayed (survives cross-page resumes)
 let lastApiError = false;
 let pendingMarkRedirect = null; // tracks the one click whose beforeunload listener is still active
 let isReplayFilling = false;          // true only while dispatchEvents() is running
@@ -72,12 +74,16 @@ function storageKey() {
   return `journey_${window.location.pathname}`;
 }
 
-/** Returns true if any ancestor has data-visible="false" */
+/** Returns true if el or any ancestor is visually hidden (display:none, visibility:hidden, or data-visible="false") */
 function isHidden(el) {
+  // Fast check: AEM's data-visible attribute on self or ancestor
   if (el.dataset && el.dataset.visible === 'false') return true;
-  let node = el.parentElement;
-  while (node) {
+  // CSS check: walk up the tree looking for display:none or visibility:hidden
+  let node = el;
+  while (node && node !== document.documentElement) {
     if (node.dataset && node.dataset.visible === 'false') return true;
+    const s = window.getComputedStyle(node);
+    if (s.display === 'none' || s.visibility === 'hidden') return true;
     node = node.parentElement;
   }
   return false;
@@ -209,16 +215,36 @@ function persistRecordingState() {
       savedAt:  Date.now(),
     }));
   } catch { /* storage full or unavailable — ignore */ }
+
+  // If this is a child recording tab, push the latest steps to background after every step.
+  // Background immediately forwards them to the parent RM tab so it stays up-to-date
+  // without depending on tab switching or closing events.
+  if (isChildRecordingTab) {
+    chrome.runtime.sendMessage({
+      type:  'CHILD_STEP_RECORDED',
+      steps: [...recordedSteps],
+      url:   window.location.href,
+    }).catch(() => {});
+  }
 }
 
 // ─── Activation Guard ────────────────────────────────────────────────────────
 // Only attach listeners and intercept network if current page matches allowed patterns.
 // If no patterns are configured, activate everywhere (default behaviour).
-chrome.storage.local.get('allowedPatterns').then(({ allowedPatterns }) => {
+chrome.storage.local.get('allowedPatterns').then(async ({ allowedPatterns }) => {
   if (allowedPatterns && allowedPatterns.length > 0) {
     const href = window.location.href;
     const allowed = allowedPatterns.some(p => href.startsWith(p.replace(/\*$/, '')));
-    if (!allowed) { log.info('Skipping — page not in allowed URL list'); return; }
+    if (!allowed) {
+      // URL doesn't match — but check if background flagged this as a child tab
+      // (recording or replay). If so, activate anyway regardless of URL filter.
+      const check = await chrome.runtime.sendMessage({ type: 'IS_CHILD_TAB' }).catch(() => ({}));
+      if (!check.isChildTab && !check.isChildTabReplay) {
+        log.info('Skipping — page not in allowed URL list');
+        return;
+      }
+      log.info('Child tab detected — activating despite URL filter');
+    }
   }
   activate();
 });
@@ -272,6 +298,65 @@ restoreRecordingStateSync();
 let isRedirectFlow = false;
 
 chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
+  // ── Child tab in RECORDING mode ──────────────────────────────────────────
+  // Background detected this tab was opened by a watched click during recording.
+  // Set the flag so persistRecordingState() forwards every step to the parent RM tab
+  // as it's recorded — no dependency on tab switching or closing.
+  if (response?.isChildTab) {
+    // Clear any RM form steps restored from shared localStorage (same origin = same storage).
+    recordedSteps.length = 0;
+    Object.keys(recordedData).forEach(k => delete recordedData[k]);
+    // If this is a subsequent page within the child tab (customer form navigated internally),
+    // background returns the steps accumulated by previous pages so they carry forward.
+    if (response.accumulatedSteps?.length > 0) {
+      recordedSteps.push(...response.accumulatedSteps);
+      log.info(`activate: child recording tab — restored ${response.accumulatedSteps.length} step(s) from previous page in this child tab`);
+    } else {
+      log.info('activate: child recording tab — starting fresh, will push each step to parent RM tab in real-time');
+    }
+    isChildRecordingTab = true;
+    return;
+  }
+
+  // ── Child tab in REPLAY mode ──────────────────────────────────────────────
+  // Background has steps queued for this tab to replay.
+  // After all steps complete, signal background → RM form auto-continues its replay.
+  if (response?.isChildTabReplay) {
+    if (response.isIntermediate) {
+      // We're on an intermediate redirect page (same or different origin as the final
+      // customer form). Do nothing — the tab will navigate to the real URL shortly.
+      // The next FORM_READY call on the final page will receive the actual steps.
+      log.info('activate: child replay tab — intermediate redirect page, waiting for final URL');
+      return;
+    }
+    log.info(`activate: child replay tab — replaying ${response.steps.length} step(s)`);
+    // Clear any RM form state restored from shared localStorage (same origin = same storage).
+    recordedSteps.length = 0;
+    Object.keys(recordedData).forEach(k => delete recordedData[k]);
+    // Set flag BEFORE replaySteps so SAVE_RESUME_STATE carries isChildTabReplay:true,
+    // allowing IS_CHILD_TAB to recognise subsequent pages in this tab (e.g. OTP page).
+    isChildReplayTab = true;
+    await new Promise(r => setTimeout(r, 1000));
+    await waitForNetwork();
+    stepReplayActive = true;
+    try {
+      const result = await replaySteps(response.steps, -1);
+      if (!result?.suspended) {
+        // All steps on this page completed — child tab replay fully done.
+        log.info('activate: child replay complete — signaling parent RM tab to continue');
+        await chrome.runtime.sendMessage({ type: 'CHILD_REPLAY_DONE' }).catch(() => {});
+      } else {
+        // Mid-replay navigation detected — next page will resume via FORM_READY and
+        // send CHILD_REPLAY_DONE once all remaining steps complete.
+        log.info('activate: child replay suspended for navigation — next page will continue');
+      }
+    } catch (err) {
+      log.warn('child tab replay error:', err);
+    }
+    stepReplayActive = false;
+    return;
+  }
+
   if (!response?.resume) {
     if (response?.pendingState) {
       isRedirectFlow = true; // We're in the middle of a redirect flow
@@ -286,8 +371,13 @@ chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
     return;
   }
   isRedirectFlow = true;
-  const { steps, resumeFromStep, stopAfterIndex } = response;
-  log.info(`replay restore: ✅ state found — resuming from step ${resumeFromStep + 1}/${steps.length}, stopAfter=${stopAfterIndex}, url=${window.location.pathname}`);
+  const { steps, resumeFromStep, stopAfterIndex, isChildTabReplay: resumeIsChildReplay } = response;
+  if (resumeIsChildReplay) {
+    // Resuming replay inside a child tab after a mid-replay navigation (e.g. consent → OTP page).
+    // Re-set the flag so subsequent SAVE_RESUME_STATE calls keep carrying isChildTabReplay:true.
+    isChildReplayTab = true;
+  }
+  log.info(`replay restore: ✅ state found — resuming from step ${resumeFromStep + 1}/${steps.length}, stopAfter=${stopAfterIndex}, childReplay=${!!resumeIsChildReplay}, url=${window.location.pathname}`);
   // Brief pause to let the form's scripts fire their initial API calls (ASE polling etc.),
   // then wait for all in-flight requests to settle before touching any fields.
   await new Promise(r => setTimeout(r, 1000));
@@ -298,7 +388,13 @@ chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
   const slicedSteps = steps.slice(resumeFromStep);
   const adjustedStop = stopAfterIndex >= resumeFromStep ? stopAfterIndex - resumeFromStep : -1;
   log.info(`replay restore: starting replaySteps with ${slicedSteps.length} remaining step(s), adjustedStop=${adjustedStop}`);
-  replaySteps(slicedSteps, adjustedStop).catch(err => {
+  replaySteps(slicedSteps, adjustedStop).then(async result => {
+    if (isChildReplayTab && !result?.suspended) {
+      // All remaining child tab steps completed on this page — signal RM to continue.
+      log.info('replay restore: child replay complete — signaling parent RM tab to continue');
+      await chrome.runtime.sendMessage({ type: 'CHILD_REPLAY_DONE' }).catch(() => {});
+    }
+  }).catch(err => {
     log.warn('replay restore: error —', err);
     stepReplayActive = false;
   });
@@ -342,6 +438,9 @@ function handleStepChange(e) {
 
 function handleStepClick(e) {
   if (stepReplayActive) return;
+  // Guard against stale content scripts after extension reload.
+  // chrome.runtime.id becomes undefined (or throws) when the context is invalidated.
+  try { if (!chrome.runtime.id) return; } catch { return; }
   const el = e.target.closest('button:not([type="reset"]), input[type="submit"], input[type="button"]');
   if (!el) return;
 
@@ -357,6 +456,40 @@ function handleStepClick(e) {
   recordedSteps.push({ type: 'click', tag, text, name, index });
   log.info('recorded click:', tag, name || text);
   persistRecordingState();
+
+  // Only watch for new-tab detection on the RM form — child tab buttons don't open new tabs,
+  // and sending START_WATCHING_TAB from the child would clear watch.watchedTabId in the
+  // background, breaking IS_CHILD_TAB for subsequent pages within the child tab.
+  if (!isChildRecordingTab) {
+    const clickStepIndex = recordedSteps.length - 1;
+    chrome.runtime.sendMessage({ type: 'START_WATCHING_TAB', isRecording: true }).catch(() => {});
+    let tabPollElapsed = 0;
+    const TAB_POLL_INTERVAL = 500;
+    const TAB_POLL_MAX = 30_000;
+    const tabPollId = setInterval(async () => {
+      tabPollElapsed += TAB_POLL_INTERVAL;
+      try {
+        const { watchedTabId } = await chrome.runtime.sendMessage({ type: 'GET_WATCH_STATE' });
+        if (watchedTabId) {
+          clearInterval(tabPollId);
+          if (recordedSteps[clickStepIndex]?.type === 'click') {
+            recordedSteps[clickStepIndex].opensNewTab = true;
+            persistRecordingState();
+            log.info('recorded click: marked opensNewTab=true for step', clickStepIndex + 1, `(detected at ${tabPollElapsed}ms)`);
+          }
+          return;
+        }
+      } catch {
+        clearInterval(tabPollId);
+        return;
+      }
+      if (tabPollElapsed >= TAB_POLL_MAX) {
+        clearInterval(tabPollId);
+        chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' }).catch(() => {});
+        log.info('recorded click: no new tab detected after 30s for step', clickStepIndex + 1);
+      }
+    }, TAB_POLL_INTERVAL);
+  }
 
   // Detect same-tab navigation after this click (e.g. Perfios redirect).
   // Cancel any listener from a previous click first — only the LAST click that causes
@@ -394,6 +527,29 @@ function handleStepClick(e) {
 
 document.addEventListener('change', handleStepChange, true);
 document.addEventListener('click', handleStepClick, true);
+
+// ── Child tab steps → embed into parent click step (recording) ──────────────
+// Background forwards child steps to the parent RM tab after each recorded step
+// (CHILD_STEP_RECORDED) and also when the child tab actually closes (tab lifecycle).
+// Both paths arrive here as RESUME_AFTER_TAB_CLOSE — just overwrite each time.
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type !== 'RESUME_AFTER_TAB_CLOSE' || stepReplayActive) return;
+  if (!message.childTabSteps?.length) return;
+  // Find the most recent click step marked opensNewTab=true (the one that opened this child)
+  let lastChildClickIdx = -1;
+  for (let i = recordedSteps.length - 1; i >= 0; i--) {
+    if (recordedSteps[i].type === 'click' && recordedSteps[i].opensNewTab) {
+      lastChildClickIdx = i;
+      break;
+    }
+  }
+  if (lastChildClickIdx >= 0) {
+    recordedSteps[lastChildClickIdx].childTabSteps = message.childTabSteps;
+    recordedSteps[lastChildClickIdx].childTabUrl   = message.childTabUrl;
+    persistRecordingState();
+    log.info(`recorded child tab: embedded ${message.childTabSteps.length} step(s) into click step ${lastChildClickIdx + 1} (url: ${message.childTabUrl})`);
+  }
+});
 
 // ─── Prefill ─────────────────────────────────────────────────────────────────
 
@@ -641,6 +797,7 @@ function waitForClickable(step) {
   });
 }
 
+
 /** Pauses until this tab is the active (visible) tab again */
 function waitForTabVisible() {
   return new Promise(resolve => {
@@ -824,8 +981,22 @@ async function replaySteps(steps, stopAfterIndex = -1) {
           resumeFromStep: i + 1,
           stopAfterIndex,
           expectedPath: window.location.origin + window.location.pathname,
+          isChildTabReplay: isChildReplayTab, // carry flag so next page knows it's still a child replay
         });
         log.info(`replay save: ⏳ saved state before click — will resume from step ${i + 2}/${steps.length} if page navigates (expectedPath=${window.location.pathname})`);
+
+        // If this click is expected to open a child tab, always queue child replay steps
+        // (even if empty) so IS_CHILD_TAB returns isChildTabReplay:true and the URL filter
+        // is bypassed, allowing the child tab's content script to activate.
+        if (step.opensNewTab) {
+          const childSteps = step.childTabSteps || [];
+          await chrome.runtime.sendMessage({
+            type: 'SAVE_CHILD_REPLAY_STEPS',
+            steps: childSteps,
+            expectedUrl: step.childTabUrl || '',  // used by bg to skip intermediate redirect pages
+          });
+          log.info(`click: queued ${childSteps.length} child tab step(s) for replay in new tab (expectedUrl=${step.childTabUrl || 'unknown'})`);
+        }
 
         let clicked = false;
 
@@ -855,6 +1026,20 @@ async function replaySteps(steps, stopAfterIndex = -1) {
           }
           clicked = true;
           await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' });
+        } else if (step.opensNewTab) {
+          // Child replay steps were already queued via SAVE_CHILD_REPLAY_STEPS above.
+          // Fire the click once (triggers the API call) and move on immediately —
+          // the child tab opens and auto-replays in the background.
+          // The next RM step's waitForFillable/waitForClickable naturally waits
+          // until the RM form is ready (e.g. button enabled after customer sync).
+          log.info('click: opensNewTab=true — firing once, child tab will auto-replay in background');
+          await chrome.runtime.sendMessage({ type: 'START_WATCHING_TAB' });
+          el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+          el.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true, cancelable: true, view: window }));
+          el.dispatchEvent(new MouseEvent('click',     { bubbles: true, cancelable: true, view: window }));
+          await waitForNetwork();
+          clicked = true;
+
         } else {
 
         while (stepReplayActive && !clicked) {
@@ -891,8 +1076,9 @@ async function replaySteps(steps, stopAfterIndex = -1) {
               await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' });
               await new Promise(r => setTimeout(r, 200));
             } else if (isHidden(stillHere)) {
-              // Button is now hidden — API likely failed and the journey was terminated
-              log.warn('click: button is hidden after click — likely API/journey failure, stopping retry');
+              // Button is now hidden (display:none / visibility:hidden) — click had its effect
+              // (e.g. "Go to Bottom" scroll helper hides itself, modal close hides the trigger, etc.)
+              log.info('click: button hidden after click — treating as success');
               clicked = true;
               await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' });
             } else {
@@ -912,12 +1098,13 @@ async function replaySteps(steps, stopAfterIndex = -1) {
                 await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' });
                 await new Promise(r => setTimeout(r, 300));
               } else {
-                // Button still visible and enabled — form validation blocked the click, retry
-                log.warn('click: button still present after click — form may have validation errors, waiting to retry…');
+                // Button still visible and enabled — click once and move on.
+                // The next step's waitForFillable will naturally wait for any
+                // side-effects (API calls, panel opening) to complete.
+                log.info('click: button still present after click — clicked once, moving on');
+                clicked = true;
                 await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' });
-                el = await waitForClickable(step);
-                await waitForNetwork();
-                await new Promise(r => setTimeout(r, 500));
+                await new Promise(r => setTimeout(r, 300));
               }
             }
           }
@@ -948,6 +1135,7 @@ async function replaySteps(steps, stopAfterIndex = -1) {
   }
   stepReplayActive = false;
   log.info('replaySteps: done');
+  return { suspended: suspendedForNavigation };
 }
 
 // ─── Message Handler (popup → content) ───────────────────────────────────────

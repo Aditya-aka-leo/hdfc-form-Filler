@@ -5,6 +5,4 @@
 
 // eslint-disable-next-line no-unused-vars
 const SKIP_CLICKS = [
-  // Dashboard refresh button — always visible, should never be auto-clicked
-  { name: 'dashboardRefreshCTA' },
 ];
