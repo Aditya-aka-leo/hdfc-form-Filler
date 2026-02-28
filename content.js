@@ -12,6 +12,7 @@ let pendingMarkRedirect = null; // tracks the one click whose beforeunload liste
 let isReplayFilling = false;          // true only while dispatchEvents() is running
 const userModifiedDuringReplay = new Set(); // field names the user manually touched during replay
 const replayTargetValues = new Map(); // fieldName → value the replay last set
+const lastRecordedFillValue = new Map(); // fieldName → last value written into recordedSteps (dedup across non-consecutive steps)
 
 // ─── Logger ───────────────────────────────────────────────────────────────────
 
@@ -246,6 +247,10 @@ function restoreRecordingStateSync() {
     if (recordedSteps.length === 0) {
       Object.assign(recordedData, data);
       recordedSteps.push(...steps);
+      // Rebuild dedup map so post-redirect recording doesn't re-record already-saved fields
+      for (const step of steps) {
+        if (step.type === 'fill') lastRecordedFillValue.set(step.name, step.value);
+      }
       log.info(`recording restore: ✅ restored — ${Object.keys(data).length} field(s), ${steps.length} step(s) (before listeners attached)`);
     }
   } catch (e) {
@@ -321,13 +326,15 @@ function handleStepChange(e) {
     ? (input.options[input.selectedIndex]?.text || '')
     : undefined;
   
-  // Deduplicate: skip if the last step is an identical fill for the same field
-  const lastStep = recordedSteps[recordedSteps.length - 1];
-  if (lastStep && lastStep.type === 'fill' && lastStep.name === name && lastStep.value === value) {
-    log.info('skipped duplicate fill:', name, '=', value);
+  // Deduplicate: skip if this field was last recorded with the same value
+  // (catches AEM re-firing change events on already-filled fields after section re-renders,
+  //  even when other fields were recorded in between)
+  if (lastRecordedFillValue.get(name) === value) {
+    log.info('skipped duplicate fill (re-fire):', name, '=', value);
     return;
   }
-  
+  lastRecordedFillValue.set(name, value);
+
   recordedSteps.push({ type: 'fill', name, value, inputType: type, ...(label !== undefined && { label }) });
   log.info('recorded fill:', name, '=', value, label ? `(label: ${label})` : '');
   persistRecordingState();
