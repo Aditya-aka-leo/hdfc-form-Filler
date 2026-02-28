@@ -51,6 +51,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 async function handleMessage(message, sender) {
   switch (message.type) {
 
+    case 'OPEN_TAB': {
+      const newTab = await chrome.tabs.create({ url: message.url });
+      console.log('[HDFC bg] OPEN_TAB: opened tab', newTab.id, '→', message.url);
+      return { ok: true, tabId: newTab.id };
+    }
+
     case 'START_WATCHING_TAB':
       watch.active = true;
       watch.resumeTabId = sender.tab.id;

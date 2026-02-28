@@ -28,7 +28,8 @@ const log = {
 // ─── Network Intercept ───────────────────────────────────────────────────────
 
 (function interceptNetwork() {
-  // Intercept fetch
+  // Intercept fetch — count active requests only
+  // (API hook interception handled by api-tab-opener.js at document_start)
   const originalFetch = window.fetch;
   window.fetch = function (...args) {
     activeRequests++;
@@ -37,7 +38,7 @@ const log = {
     });
   };
 
-  // Intercept XHR
+  // Intercept XHR — count active requests only
   const originalOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
     this._capturedUrl = url;
@@ -94,7 +95,6 @@ function shouldSkip(input) {
   const name = input.name || '';
   if (!name) return true;
   if (name.startsWith('hidden')) return true;
-  if (name.toLowerCase().includes('otp')) return true;
   if (input.readOnly) return true;
   if (input.disabled) return true;
   return false;
@@ -815,6 +815,7 @@ function waitForTabVisible() {
 async function replaySteps(steps, stopAfterIndex = -1) {
   log.info(`replaySteps: starting — ${steps.length} step(s)${stopAfterIndex >= 0 ? `, stop after step ${stopAfterIndex + 1}` : ''}`);
   console.log('[Recorder] replaySteps stopAfterIndex =', stopAfterIndex);
+  document.documentElement.setAttribute('data-hdfc-replay', '1');
 
   // If the page navigates mid-replay (e.g. same-tab Perfios redirect), stop immediately.
   // SAVE_RESUME_STATE is saved before each click so FORM_READY can resume after the redirect.
@@ -853,7 +854,7 @@ async function replaySteps(steps, stopAfterIndex = -1) {
       if (!input) { log.warn('fill: stopped', step.name); log.end(); continue; }
       // Skip only hard conditions — not isHidden, since field was visible at record time
       const _n = input.name || '';
-      if (!_n || _n.startsWith('hidden') || _n.toLowerCase().includes('otp') || input.readOnly || input.disabled) {
+      if (!_n || _n.startsWith('hidden') || input.readOnly || input.disabled) {
         log.warn('fill: skipping', step.name); log.end(); continue;
       }
       const type = (step.inputType || input.type)?.toLowerCase();
@@ -1129,6 +1130,7 @@ async function replaySteps(steps, stopAfterIndex = -1) {
   if (!suspendedForNavigation) {
     // Replay finished normally or was user-stopped — clear any lingering resume state.
     // If navigating, preserve the state so FORM_READY can resume after the redirect.
+    document.documentElement.removeAttribute('data-hdfc-replay');
     await chrome.runtime.sendMessage({ type: 'CLEAR_RESUME_STATE' }).catch(() => {});
   } else {
     log.info('replaySteps: navigation in progress — preserving resume state for FORM_READY');
@@ -1176,6 +1178,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
     case 'STOP_STEP_REPLAY': {
       stepReplayActive = false;
+      document.documentElement.removeAttribute('data-hdfc-replay');
       sendResponse({ ok: true });
       break;
     }

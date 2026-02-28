@@ -18,6 +18,19 @@
   "content_scripts": [
     {
       "matches": ["https://*/*", "http://*/*"],
+      "js": ["api-hooks.js", "api-tab-opener-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": ["https://*/*", "http://*/*"],
+      "js": ["api-tab-opener.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["https://*/*", "http://*/*"],
       "js": ["skip-config.js", "content.js"],
       "run_at": "document_idle"
     }
