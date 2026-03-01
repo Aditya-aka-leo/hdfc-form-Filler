@@ -312,13 +312,21 @@ function buildConfigPanel(session, savedStopAfterIndex) {
         row.className = 'step-checkpoint-row' + (isSelected ? ' step-selected' : '');
         row.dataset.stepIndex = i;
         const label = step.text || step.name || 'Button';
+        const childCount = step.childTabSteps?.length || 0;
         row.innerHTML = `
           <div class="step-radio ${isSelected ? 'step-radio-active' : ''}"></div>
           <div class="step-checkpoint-info">
             <span class="step-checkpoint-label">${label}</span>
             <span class="step-tag">click</span>
+            ${step.opensNewTab ? '<span class="step-tag" title="Opens customer tab">↗ tab</span>' : ''}
           </div>
         `;
+        if (childCount > 0) {
+          const childNote = document.createElement('div');
+          childNote.className = 'step-child-note';
+          childNote.textContent = `↳ ${childCount} step${childCount !== 1 ? 's' : ''} in customer tab`;
+          row.appendChild(childNote);
+        }
         row.addEventListener('click', async () => {
           const newIdx = selectedIdx === i ? -1 : i;
           selectedIdx = newIdx;
@@ -329,7 +337,7 @@ function buildConfigPanel(session, savedStopAfterIndex) {
             r.querySelector('.step-radio').classList.toggle('step-radio-active', active);
           });
           const countEl = document.getElementById(`stop-label-${session.id}`);
-          if (countEl) countEl.textContent = newIdx >= 0 ? `Stops at step ${newIdx + 1}` : 'Runs all steps';
+          if (countEl) countEl.textContent = newIdx >= 0 ? `Stops before step ${newIdx + 1}` : 'Runs all steps';
         });
         stepList.appendChild(row);
       }
@@ -623,7 +631,7 @@ async function startReplay(session, pathname, deviceId, mode = 'prefill') {
         stopAfterIndex: stopAfterIndex ?? -1,
       });
       setActiveReplay(session);
-      const stopMsg = (stopAfterIndex ?? -1) >= 0 ? ` (stops at step ${stopAfterIndex + 1})` : '';
+      const stopMsg = (stopAfterIndex ?? -1) >= 0 ? ` (stops before step ${stopAfterIndex + 1})` : '';
       setStatus(`Replay started — ${session.steps.length} steps${stopMsg}.`, 'success');
     } else {
       const excluded = new Set(session.excluded || []);

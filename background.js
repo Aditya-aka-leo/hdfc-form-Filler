@@ -144,24 +144,15 @@ async function handleMessage(message, sender) {
         '| childReplayStore hit:', isChildTabReplay,
         '| pendingChildReplaySteps:', !!watch.pendingChildReplaySteps);
 
-      // Fallback A: onCreated may have been missed (hdfc:// redirect is slow and
-      // STOP_WATCHING_TAB from a later RM step ran first) or may have captured the wrong
-      // intermediate tab. If pending steps exist and this page's origin matches the
-      // expected customer-form origin, adopt this tab directly without waiting for onCreated.
+      // Fallback A: onCreated may have been missed (race with STOP_WATCHING_TAB).
+      // If pending steps exist, adopt this tab directly — no origin check needed since
+      // the tab is opened directly at the customer form URL via API hook.
       if (!isChildTabReplay && watch.pendingChildReplaySteps) {
-        let currentOrigin = '', expectedOrigin = '';
-        try { currentOrigin = new URL(sender.tab.url).origin; } catch { /* ignore */ }
-        try { expectedOrigin = new URL(watch.pendingChildReplaySteps.expectedUrl).origin; } catch { /* ignore */ }
-        console.log('[HDFC bg] IS_CHILD_TAB fallback A — currentOrigin:', currentOrigin, 'expectedOrigin:', expectedOrigin);
-        if (currentOrigin && expectedOrigin && currentOrigin === expectedOrigin) {
-          childReplayStore[sender.tab.id] = watch.pendingChildReplaySteps;
-          watch.pendingChildReplaySteps = null;
-          watch.watchedTabId = sender.tab.id;
-          isChildTabReplay = true;
-          console.log('[HDFC bg] IS_CHILD_TAB fallback A — adopted tab', sender.tab.id, 'as child replay tab');
-        } else {
-          console.log('[HDFC bg] IS_CHILD_TAB fallback A — origin mismatch, not adopting');
-        }
+        childReplayStore[sender.tab.id] = watch.pendingChildReplaySteps;
+        watch.pendingChildReplaySteps = null;
+        watch.watchedTabId = sender.tab.id;
+        isChildTabReplay = true;
+        console.log('[HDFC bg] IS_CHILD_TAB fallback A — adopted tab', sender.tab.id, 'as child replay tab');
       }
 
       // Fallback B: subsequent pages within the same child tab after a mid-replay navigation.
@@ -196,32 +187,10 @@ async function handleMessage(message, sender) {
       }
 
       // Child tab in replay mode — send it the steps to replay.
-      // If the step has a known final URL, check if we're on an intermediate redirect page
-      // (e.g. hdfc:// → https://same-origin/redirect → https://same-origin/customer-form).
-      // Compare both origin AND pathname — the hdfc:// deep link may redirect through an
-      // intermediate page on the SAME origin as the final customer form, so origin alone is
-      // not sufficient to detect intermediate pages.
+      // The tab is opened directly at the customer form URL (via API hook), so there
+      // are no intermediate redirect pages to skip. Deliver steps immediately.
       if (childReplayStore[sender.tab.id]) {
-        const entry = childReplayStore[sender.tab.id];
-        const { steps, expectedUrl } = entry;
-
-        if (expectedUrl) {
-          let currentOrigin = '', expectedOrigin = '';
-          let currentPath = '', expectedPath = '';
-          try { const u = new URL(sender.tab.url); currentOrigin = u.origin; currentPath = u.pathname; } catch { /* ignore */ }
-          try { const u = new URL(expectedUrl);    expectedOrigin = u.origin; expectedPath = u.pathname; } catch { /* ignore */ }
-
-          const differentOrigin = currentOrigin && expectedOrigin && currentOrigin !== expectedOrigin;
-          const sameOriginDifferentPath = currentOrigin && expectedOrigin && currentOrigin === expectedOrigin
-            && currentPath && expectedPath && currentPath !== expectedPath;
-
-          if (differentOrigin || sameOriginDifferentPath) {
-            // Intermediate redirect page — keep store, signal content script to wait.
-            // Next FORM_READY on the final page will get the real steps.
-            return { isChildTabReplay: true, steps: [], isIntermediate: true };
-          }
-        }
-
+        const { steps } = childReplayStore[sender.tab.id];
         delete childReplayStore[sender.tab.id];
         return { isChildTabReplay: true, steps };
       }

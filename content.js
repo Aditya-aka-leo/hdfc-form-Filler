@@ -158,6 +158,7 @@ function waitForDropdownOption(target) {
     'ul.dropdown-menu li', 'li.ui-autocomplete-item',
   ].join(', ');
   const find = () => Array.from(document.querySelectorAll(SELECTORS)).find(el => {
+    if (isHidden(el)) return false; // skip options inside hidden dropdown containers
     const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
     return text === t || text.includes(t) || el.getAttribute('data-value') === t;
   });
@@ -322,13 +323,6 @@ chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
   // Background has steps queued for this tab to replay.
   // After all steps complete, signal background → RM form auto-continues its replay.
   if (response?.isChildTabReplay) {
-    if (response.isIntermediate) {
-      // We're on an intermediate redirect page (same or different origin as the final
-      // customer form). Do nothing — the tab will navigate to the real URL shortly.
-      // The next FORM_READY call on the final page will receive the actual steps.
-      log.info('activate: child replay tab — intermediate redirect page, waiting for final URL');
-      return;
-    }
     log.info(`activate: child replay tab — replaying ${response.steps.length} step(s)`);
     // Clear any RM form state restored from shared localStorage (same origin = same storage).
     recordedSteps.length = 0;
@@ -651,10 +645,10 @@ function waitForElement(selector, timeout = 2000) {
   });
 }
 
-/** Polls until a fill-step's input exists in the DOM AND is not hidden by AEM
- *  (no ancestor with data-visible="false"). We intentionally do NOT check
- *  getBoundingClientRect here — typeahead selects have display:none on the native
- *  <select> but no data-visible="false" ancestor, so they must pass immediately.
+/** Polls until a fill-step's input exists in the DOM AND is not hidden by AEM.
+ *  For AEM typeahead selects (native <select> always display:none), resolves as
+ *  soon as the sibling .dynamic-dropdown-input becomes visible — meaning the
+ *  ancestor wrapper's data-visible toggled to true (e.g. after "channel" → "DIRECT").
  *  After 30s we fall back and return the element even if still hidden. */
 function waitForFillable(name) {
   const selector = `[name="${CSS.escape(name)}"]`;
@@ -672,6 +666,17 @@ function waitForFillable(name) {
           clearInterval(id);
           log.info(`waitForFillable: ready "${name}"`);
           return resolve(el);
+        }
+        // AEM typeahead: native <select> always has display:none; the visible
+        // indicator is the sibling .dynamic-dropdown-input becoming un-hidden
+        // (its ancestor wrapper toggles data-visible when the triggering field changes).
+        if (el.tagName === 'SELECT') {
+          const dynInput = el.parentElement?.querySelector('.dynamic-dropdown-input');
+          if (dynInput && !isHidden(dynInput)) {
+            clearInterval(id);
+            log.info(`waitForFillable: ready "${name}" (typeahead input visible)`);
+            return resolve(el);
+          }
         }
         // AEM has this field's section marked data-visible="false" — wait for it
         if (elapsed >= VISIBILITY_TIMEOUT_MS) {
@@ -832,8 +837,8 @@ async function replaySteps(steps, stopAfterIndex = -1) {
     if (!stepReplayActive) { log.info('replaySteps: stopped'); break; }
     // Safety: if a previous iteration used `continue` and skipped the end-of-loop
     // stop check, catch it here at the start of the next iteration.
-    if (stopAfterIndex >= 0 && i > stopAfterIndex) {
-      log.info('replaySteps: stop checkpoint passed — halting before step', i + 1);
+    if (stopAfterIndex >= 0 && i >= stopAfterIndex) {
+      log.info('replaySteps: stop checkpoint — halting before step', i + 1, '(selected step not fired)');
       break;
     }
 
@@ -1121,10 +1126,6 @@ async function replaySteps(steps, stopAfterIndex = -1) {
     }
 
     log.end();
-    if (stopAfterIndex >= 0 && i >= stopAfterIndex) {
-      log.info('replaySteps: stop checkpoint reached at step', i + 1, '— pausing replay');
-      break;
-    }
   }
   window.removeEventListener('beforeunload', onNavigate);
   if (!suspendedForNavigation) {
