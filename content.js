@@ -5,7 +5,6 @@ let replayData = null;
 let replayObserver = null;
 let fillInProgress = false;
 let pendingFill = false;
-let activeRequests = 0;
 let stepReplayActive = false;
 let isChildRecordingTab = false; // true when this tab is a child being recorded
 let isChildReplayTab   = false; // true when this tab is a child being replayed (survives cross-page resumes)
@@ -25,45 +24,17 @@ const log = {
   end:   ()        => console.groupEnd(),
 };
 
-// ─── Network Intercept ───────────────────────────────────────────────────────
-
-(function interceptNetwork() {
-  // Intercept fetch — count active requests only
-  // (API hook interception handled by api-tab-opener.js at document_start)
-  const originalFetch = window.fetch;
-  window.fetch = function (...args) {
-    activeRequests++;
-    return originalFetch.apply(this, args).finally(() => {
-      activeRequests = Math.max(0, activeRequests - 1);
-    });
-  };
-
-  // Intercept XHR — count active requests only
-  const originalOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    this._capturedUrl = url;
-    return originalOpen.apply(this, [method, url, ...rest]);
-  };
-
-  const originalSend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.send = function (...args) {
-    activeRequests++;
-    this.addEventListener('loadend', () => {
-      activeRequests = Math.max(0, activeRequests - 1);
-    });
-    return originalSend.apply(this, args);
-  };
-})();
-
-/** Resolves once there are no in-flight fetch/XHR requests */
+/** Resolves once there are no in-flight fetch/XHR requests.
+ *  The page's actual fetch/XHR calls are intercepted by api-tab-opener-main.js
+ *  (MAIN world) which sets data-hdfc-pending on <html> while requests are active.
+ *  Isolated-world fetch overrides don't reach the page's own calls, so we read
+ *  the DOM attribute instead of counting locally. */
 function waitForNetwork() {
   return new Promise(resolve => {
-    if (activeRequests === 0) return resolve();
+    const isPending = () => document.documentElement.hasAttribute('data-hdfc-pending');
+    if (!isPending()) return resolve();
     const id = setInterval(() => {
-      if (activeRequests === 0) {
-        clearInterval(id);
-        resolve();
-      }
+      if (!isPending()) { clearInterval(id); resolve(); }
     }, 20);
   });
 }
