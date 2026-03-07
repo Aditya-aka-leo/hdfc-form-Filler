@@ -213,7 +213,7 @@ function enabledCount(session) {
   return Object.keys(session.data).length - excluded.size;
 }
 
-function buildConfigPanel(session, savedStopAfterIndex) {
+async function buildConfigPanel(session, savedStopAfterIndex) {
   const panel = document.createElement('div');
   panel.className = 'field-panel';
   panel.dataset.panelId = session.id;
@@ -222,9 +222,11 @@ function buildConfigPanel(session, savedStopAfterIndex) {
   const tabBar = document.createElement('div');
   tabBar.className = 'config-tab-bar';
   const hasSteps = session.steps && session.steps.length > 0;
+  const hasApis = session.apiRecordings && session.apiRecordings.length > 0;
   tabBar.innerHTML = `
     <button class="config-tab config-tab-active" data-tab="fields">Fields</button>
     ${hasSteps ? '<button class="config-tab" data-tab="steps">Steps</button>' : ''}
+    ${hasApis ? '<button class="config-tab" data-tab="apis">APIs</button>' : ''}
   `;
   panel.appendChild(tabBar);
 
@@ -359,6 +361,138 @@ function buildConfigPanel(session, savedStopAfterIndex) {
     panel.appendChild(stepsPane);
   }
 
+  // ── APIs pane ─────────────────────────────────────────────────────────────────
+  if (hasApis) {
+    // Key = "METHOD:filename" — groups all recordings of the same API together
+    const apiKey = rec => {
+      const method = (rec.method || 'GET').toUpperCase();
+      try {
+        const segs = new URL(rec.url).pathname.split('/').filter(Boolean);
+        return `${method}:${segs[segs.length - 1] || rec.url}`;
+      } catch { return `${method}:${rec.url.split('/').filter(Boolean).pop() || rec.url}`; }
+    };
+    // Deduplicated list of unique API keys (preserving first-seen order)
+    const uniqueKeys = [...new Map(session.apiRecordings.map(r => [apiKey(r), r])).entries()];
+
+    const apisPane = document.createElement('div');
+    apisPane.dataset.pane = 'apis';
+    apisPane.style.display = 'none';
+
+    // Load persisted state for this session
+    const storageKeys = [`enabledApiRecordings_${session.id}`, `virtualizeApis_${session.id}`];
+    const stored = await chrome.storage.local.get(storageKeys);
+    // Migrate from old index-based format (array of numbers) — treat as all-enabled
+    const storedKeysRaw = stored[`enabledApiRecordings_${session.id}`];
+    const storedKeys = Array.isArray(storedKeysRaw) && storedKeysRaw.every(k => typeof k === 'string')
+      ? storedKeysRaw : null;
+    const virtualizeOn = !!stored[`virtualizeApis_${session.id}`];
+
+    // localEnabled: Set of API keys currently enabled (default: all)
+    const localEnabled = new Set(
+      storedKeys == null ? uniqueKeys.map(([k]) => k) : storedKeys
+    );
+
+    // ── Header row: title + master "Virtualize" toggle ────────────────────────
+    const apisHeader = document.createElement('div');
+    apisHeader.className = 'field-panel-header';
+    apisHeader.style.display = 'flex';
+    apisHeader.style.alignItems = 'center';
+    apisHeader.style.justifyContent = 'space-between';
+
+    const headerLeft = document.createElement('div');
+    headerLeft.style.display = 'flex';
+    headerLeft.style.flexDirection = 'column';
+    headerLeft.style.gap = '2px';
+    headerLeft.innerHTML = `
+      <span class="field-panel-title">API Responses</span>
+      <span class="field-panel-count" id="api-count-${session.id}">
+        ${virtualizeOn ? `${localEnabled.size} of ${uniqueKeys.length} will be virtualized` : 'Virtualization off'}
+      </span>
+    `;
+
+    const masterToggleLabel = document.createElement('label');
+    masterToggleLabel.className = 'toggle';
+    masterToggleLabel.title = 'Enable API virtualization for this journey';
+    masterToggleLabel.innerHTML = `
+      <input type="checkbox" id="virtualize-master-${session.id}" ${virtualizeOn ? 'checked' : ''} />
+      <span class="toggle-track"><span class="toggle-thumb"></span></span>
+    `;
+    apisHeader.appendChild(headerLeft);
+    apisHeader.appendChild(masterToggleLabel);
+    apisPane.appendChild(apisHeader);
+
+    // ── Hint ──────────────────────────────────────────────────────────────────
+    const hint = document.createElement('div');
+    hint.className = 'steps-hint';
+    hint.textContent = 'Toggle on to serve recorded responses during replay. Check which calls to virtualize.';
+    apisPane.appendChild(hint);
+
+    // ── API rows (one per unique API) ─────────────────────────────────────────
+    const apiList = document.createElement('div');
+    apiList.className = 'field-panel-list';
+    if (!virtualizeOn) apiList.style.opacity = '0.4';
+    if (!virtualizeOn) apiList.style.pointerEvents = 'none';
+
+    async function saveState() {
+      await chrome.storage.local.set({
+        [`enabledApiRecordings_${session.id}`]: [...localEnabled],
+      });
+      const countEl = document.getElementById(`api-count-${session.id}`);
+      if (countEl) {
+        const masterOn = document.getElementById(`virtualize-master-${session.id}`)?.checked;
+        countEl.textContent = masterOn
+          ? `${localEnabled.size} of ${uniqueKeys.length} will be virtualized`
+          : 'Virtualization off';
+      }
+    }
+
+    uniqueKeys.forEach(([key, rec]) => {
+      const isEnabled = localEnabled.has(key);
+      const filename = key.split(':')[1];
+      const method = (rec.method || 'GET').toUpperCase();
+      const count = session.apiRecordings.filter(r => apiKey(r) === key).length;
+      const row = document.createElement('div');
+      row.className = 'field-row' + (isEnabled ? '' : ' field-row-disabled');
+      row.innerHTML = `
+        <div class="field-row-info">
+          <span class="field-row-name">
+            <span class="api-method-badge">${method}</span>
+            ${filename}${count > 1 ? ` <span style="opacity:0.5;font-size:10px">(×${count})</span>` : ''}
+          </span>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" ${isEnabled ? 'checked' : ''} />
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+        </label>
+      `;
+      row.querySelector('input').addEventListener('change', async (e) => {
+        row.classList.toggle('field-row-disabled', !e.target.checked);
+        if (e.target.checked) localEnabled.add(key);
+        else localEnabled.delete(key);
+        await saveState();
+      });
+      apiList.appendChild(row);
+    });
+
+    apisPane.appendChild(apiList);
+    panel.appendChild(apisPane);
+
+    // ── Master toggle handler ─────────────────────────────────────────────────
+    masterToggleLabel.querySelector('input').addEventListener('change', async (e) => {
+      const on = e.target.checked;
+      await chrome.storage.local.set({ [`virtualizeApis_${session.id}`]: on });
+      apiList.style.opacity = on ? '' : '0.4';
+      apiList.style.pointerEvents = on ? '' : 'none';
+      const countEl = document.getElementById(`api-count-${session.id}`);
+      if (countEl) {
+        countEl.textContent = on
+          ? `${localEnabled.size} of ${uniqueKeys.length} will be virtualized`
+          : 'Virtualization off';
+      }
+      console.log('[Recorder] virtualizeApis for', session.id, '→', on);
+    });
+  }
+
   // ── Tab switching ─────────────────────────────────────────────────────────────
   tabBar.querySelectorAll('.config-tab').forEach(tab => {
     tab.addEventListener('click', () => {
@@ -469,7 +603,7 @@ function renderList(sessions, pathname, deviceId) {
         openPanelId = session.id;
         btnConfigure.classList.add('btn-active');
         const { [`stopAfterStep_${session.id}`]: saved } = await chrome.storage.local.get(`stopAfterStep_${session.id}`);
-        const panel = buildConfigPanel(session, saved ?? -1);
+        const panel = await buildConfigPanel(session, saved ?? -1);
         item.insertAdjacentElement('afterend', panel);
       }
     });
@@ -522,7 +656,7 @@ function renderList(sessions, pathname, deviceId) {
     if (isPanelOpen) {
       (async () => {
         const { [`stopAfterStep_${session.id}`]: saved } = await chrome.storage.local.get(`stopAfterStep_${session.id}`);
-        const panel = buildConfigPanel(session, saved ?? -1);
+        const panel = await buildConfigPanel(session, saved ?? -1);
         item.insertAdjacentElement('afterend', panel);
       })();
     }
@@ -575,10 +709,12 @@ async function saveJourney(pathname, deviceId) {
   };
 
   let steps = [];
+  let apiRecordings = [];
   const shareWithTeam = document.getElementById('shareStepsToggle')?.checked;
   try {
     const stepsResponse = await chrome.tabs.sendMessage(tab.id, { type: 'GET_STEPS' });
     steps = stepsResponse.steps || [];
+    apiRecordings = stepsResponse.apiRecordings || [];
   } catch { /* ignore */ }
 
   // Clear persisted recording state so a subsequent fresh recording on the same
@@ -588,6 +724,7 @@ async function saveJourney(pathname, deviceId) {
   // Toggle OFF → save locally only, no DB. User can share later via the Share button.
   if (!shareWithTeam) {
     const localSession = { ...session, steps, _local: true };
+    if (apiRecordings.length) localSession.apiRecordings = apiRecordings;
     await chrome.storage.local.set({ [`local_${session.id}`]: localSession });
     nameInput.value = '';
     setStatus(`"${label}" saved locally. Enable "Share steps with team" to share.`, 'default');
@@ -598,6 +735,7 @@ async function saveJourney(pathname, deviceId) {
 
   // Toggle ON → save to DB with steps so teammates can replay
   if (steps.length) session.steps = steps;
+  if (apiRecordings.length) session.apiRecordings = apiRecordings;
 
   try {
     await apiFetch('/sessions', {
@@ -611,6 +749,7 @@ async function saveJourney(pathname, deviceId) {
   } catch {
     // Server offline — save everything locally so no work is lost
     const localSession = { ...session, steps, _local: true };
+    if (apiRecordings.length) localSession.apiRecordings = apiRecordings;
     await chrome.storage.local.set({ [`local_${session.id}`]: localSession });
     nameInput.value = '';
     setStatus(`Server offline — "${label}" saved locally. Share it later.`, 'default');
@@ -625,9 +764,41 @@ async function startReplay(session, pathname, deviceId, mode = 'prefill') {
     if (mode === 'steps' && session.steps && session.steps.length > 0) {
       const { [`stopAfterStep_${session.id}`]: stopAfterIndex } = await chrome.storage.local.get(`stopAfterStep_${session.id}`);
       console.log('[Recorder] startReplay: stopAfterIndex =', stopAfterIndex, '→ sending', stopAfterIndex ?? -1);
+
+      // Build the list of API recordings to virtualize (per-session toggle)
+      let apiRecordings = [];
+      if (session.apiRecordings?.length) {
+        const storageKeys = [`virtualizeApis_${session.id}`, `enabledApiRecordings_${session.id}`];
+        const stored = await chrome.storage.local.get(storageKeys);
+        const virtualizeOn = !!stored[`virtualizeApis_${session.id}`];
+        if (virtualizeOn) {
+          // Migrate from old index-based format (array of numbers) — treat as all-enabled
+          const enabledKeysRaw = stored[`enabledApiRecordings_${session.id}`];
+          const enabledKeys = Array.isArray(enabledKeysRaw) && enabledKeysRaw.every(k => typeof k === 'string')
+            ? enabledKeysRaw : null;
+          const apiKey = rec => {
+            const method = (rec.method || 'GET').toUpperCase();
+            try {
+              const segs = new URL(rec.url).pathname.split('/').filter(Boolean);
+              return `${method}:${segs[segs.length - 1] || rec.url}`;
+            } catch { return `${method}:${rec.url.split('/').filter(Boolean).pop() || rec.url}`; }
+          };
+          if (enabledKeys == null) {
+            apiRecordings = session.apiRecordings; // all enabled by default
+          } else {
+            const enabled = new Set(enabledKeys);
+            apiRecordings = session.apiRecordings.filter(rec => enabled.has(apiKey(rec)));
+          }
+          console.log('[Recorder] startReplay: virtualizeApis ON — sending', apiRecordings.length, 'of', session.apiRecordings.length, 'recorded response(s)');
+        } else {
+          console.log('[Recorder] startReplay: virtualizeApis OFF for this journey — no API virtualization');
+        }
+      }
+
       await chrome.tabs.sendMessage(tab.id, {
         type: 'START_STEP_REPLAY',
         steps: session.steps,
+        apiRecordings,
         stopAfterIndex: stopAfterIndex ?? -1,
       });
       setActiveReplay(session);
@@ -739,6 +910,7 @@ async function init() {
       chrome.storage.local.set({ shareSteps: shareStepsToggle.checked });
     });
   }
+
 
   const sessions = await loadSessions(pathname);
   renderList(sessions, pathname, deviceId);

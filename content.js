@@ -1,6 +1,7 @@
 // ─── State ───────────────────────────────────────────────────────────────────
 const recordedData = {};
 const recordedSteps = [];
+const recordedApiResponses = []; // API responses captured during recording (matched by VIRTUAL_APIS patterns)
 let replayData = null;
 let replayObserver = null;
 let fillInProgress = false;
@@ -28,13 +29,23 @@ const log = {
  *  The page's actual fetch/XHR calls are intercepted by api-tab-opener-main.js
  *  (MAIN world) which sets data-hdfc-pending on <html> while requests are active.
  *  Isolated-world fetch overrides don't reach the page's own calls, so we read
- *  the DOM attribute instead of counting locally. */
+ *  the DOM attribute instead of counting locally.
+ *
+ *  Requires 2 consecutive idle polls (40ms stable) before resolving. This
+ *  absorbs the race where a virtual API response resolves and the form then
+ *  triggers a non-virtualized real API call via setTimeout/async — without the
+ *  debounce, _pending could briefly hit 0 between the two calls and resolve early. */
 function waitForNetwork() {
   return new Promise(resolve => {
     const isPending = () => document.documentElement.hasAttribute('data-hdfc-pending');
-    if (!isPending()) return resolve();
+    let idleStreak = 0;
+    const IDLE_POLLS_REQUIRED = 2; // 2 × 20ms = 40ms stable idle
     const id = setInterval(() => {
-      if (!isPending()) { clearInterval(id); resolve(); }
+      if (!isPending()) {
+        if (++idleStreak >= IDLE_POLLS_REQUIRED) { clearInterval(id); resolve(); }
+      } else {
+        idleStreak = 0;
+      }
     }, 20);
   });
 }
@@ -193,9 +204,10 @@ function persistRecordingState() {
   // without depending on tab switching or closing events.
   if (isChildRecordingTab) {
     chrome.runtime.sendMessage({
-      type:  'CHILD_STEP_RECORDED',
-      steps: [...recordedSteps],
-      url:   window.location.href,
+      type:         'CHILD_STEP_RECORDED',
+      steps:        [...recordedSteps],
+      apiRecordings: [...recordedApiResponses],
+      url:          window.location.href,
     }).catch(() => {});
   }
 }
@@ -262,6 +274,14 @@ log.info('activate: fired —', window.location.href);
 // Restore old recording state BEFORE attaching listeners (prevents new steps from being recorded before old ones are restored)
 restoreRecordingStateSync();
 
+// ─── API virtualization bridge ────────────────────────────────────────────────
+// MAIN world (api-tab-opener-main.js) dispatches this event when a fetch/XHR
+// response matches a VIRTUAL_APIS pattern during recording.
+document.addEventListener('__hdfc_api_recorded__', (e) => {
+  recordedApiResponses.push(e.detail);
+  log.info('api-recorded: captured', e.detail.method, e.detail.url, `(total: ${recordedApiResponses.length})`);
+});
+
 // ─── Resume replay after same-tab redirect (e.g. Perfios) ────────────────────
 // Ask background if there is a pending resume state for this tab.
 // Background holds it in chrome.storage.session (survives SW restarts).
@@ -301,8 +321,14 @@ chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
     // Set flag BEFORE replaySteps so SAVE_RESUME_STATE carries isChildTabReplay:true,
     // allowing IS_CHILD_TAB to recognise subsequent pages in this tab (e.g. OTP page).
     isChildReplayTab = true;
+    // Pass virtual API responses to MAIN world before replay begins (child tab)
+    document.dispatchEvent(new CustomEvent('__hdfc_set_virtual_responses__', {
+      detail: response.apiRecordings || [],
+    }));
     await new Promise(r => setTimeout(r, 1000));
     await waitForNetwork();
+    log.info('activate: child replay — network idle, waiting for form to finish rendering');
+    await new Promise(r => setTimeout(r, 500));
     stepReplayActive = true;
     try {
       const result = await replaySteps(response.steps, -1);
@@ -509,10 +535,11 @@ chrome.runtime.onMessage.addListener((message) => {
     }
   }
   if (lastChildClickIdx >= 0) {
-    recordedSteps[lastChildClickIdx].childTabSteps = message.childTabSteps;
-    recordedSteps[lastChildClickIdx].childTabUrl   = message.childTabUrl;
+    recordedSteps[lastChildClickIdx].childTabSteps        = message.childTabSteps;
+    recordedSteps[lastChildClickIdx].childTabUrl          = message.childTabUrl;
+    recordedSteps[lastChildClickIdx].childTabApiRecordings = message.childTabApiRecordings || [];
     persistRecordingState();
-    log.info(`recorded child tab: embedded ${message.childTabSteps.length} step(s) into click step ${lastChildClickIdx + 1} (url: ${message.childTabUrl})`);
+    log.info(`recorded child tab: embedded ${message.childTabSteps.length} step(s) and ${message.childTabApiRecordings?.length ?? 0} api recording(s) into click step ${lastChildClickIdx + 1} (url: ${message.childTabUrl})`);
   }
 });
 
@@ -968,11 +995,12 @@ async function replaySteps(steps, stopAfterIndex = -1) {
         if (step.opensNewTab) {
           const childSteps = step.childTabSteps || [];
           await chrome.runtime.sendMessage({
-            type: 'SAVE_CHILD_REPLAY_STEPS',
-            steps: childSteps,
-            expectedUrl: step.childTabUrl || '',  // used by bg to skip intermediate redirect pages
+            type:         'SAVE_CHILD_REPLAY_STEPS',
+            steps:        childSteps,
+            apiRecordings: step.childTabApiRecordings || [],
+            expectedUrl:  step.childTabUrl || '',  // used by bg to skip intermediate redirect pages
           });
-          log.info(`click: queued ${childSteps.length} child tab step(s) for replay in new tab (expectedUrl=${step.childTabUrl || 'unknown'})`);
+          log.info(`click: queued ${childSteps.length} child tab step(s) and ${step.childTabApiRecordings?.length ?? 0} api recording(s) for replay in new tab (expectedUrl=${step.childTabUrl || 'unknown'})`);
         }
 
         let clicked = false;
@@ -1137,12 +1165,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       break;
     }
     case 'GET_STEPS': {
-      log.info('GET_STEPS: returning', recordedSteps.length, 'step(s)');
-      sendResponse({ steps: [...recordedSteps] });
+      log.info('GET_STEPS: returning', recordedSteps.length, 'step(s),', recordedApiResponses.length, 'api recording(s)');
+      sendResponse({ steps: [...recordedSteps], apiRecordings: [...recordedApiResponses] });
       break;
     }
     case 'START_STEP_REPLAY': {
-      log.info('START_STEP_REPLAY:', message.steps.length, 'step(s)');
+      log.info('START_STEP_REPLAY:', message.steps.length, 'step(s),', (message.apiRecordings?.length ?? 0), 'virtual api response(s)');
+      // Pass virtual API responses to MAIN world before replay begins
+      document.dispatchEvent(new CustomEvent('__hdfc_set_virtual_responses__', {
+        detail: message.apiRecordings || [],
+      }));
       stepReplayActive = true;
       replaySteps(message.steps, message.stopAfterIndex ?? -1).catch((err) => { log.warn('replaySteps error:', err); stepReplayActive = false; });
       sendResponse({ ok: true });
@@ -1156,6 +1188,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
     case 'CLEAR_RECORDING_STATE': {
       try { window.localStorage.removeItem(LS_KEY); } catch {}
+      recordedApiResponses.length = 0;
+      document.dispatchEvent(new CustomEvent('__hdfc_set_virtual_responses__', { detail: [] }));
       sendResponse({ ok: true });
       break;
     }

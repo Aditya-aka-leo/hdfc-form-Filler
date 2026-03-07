@@ -99,12 +99,13 @@ async function handleMessage(message, sender) {
     // (fired from persistRecordingState when isChildRecordingTab=true).
     // Background stores them and forwards to the parent RM tab in real-time.
     case 'CHILD_STEP_RECORDED': {
-      childStepsStore[sender.tab.id] = { steps: message.steps, url: message.url };
+      childStepsStore[sender.tab.id] = { steps: message.steps, apiRecordings: message.apiRecordings || [], url: message.url };
       if (watch.watchedTabId === sender.tab.id && watch.resumeTabId) {
         chrome.tabs.sendMessage(watch.resumeTabId, {
-          type:          'RESUME_AFTER_TAB_CLOSE',
-          childTabSteps: message.steps,
-          childTabUrl:   message.url,
+          type:                 'RESUME_AFTER_TAB_CLOSE',
+          childTabSteps:        message.steps,
+          childTabApiRecordings: message.apiRecordings || [],
+          childTabUrl:          message.url,
         }).catch(() => {});
       }
       return { ok: true };
@@ -171,7 +172,7 @@ async function handleMessage(message, sender) {
 
     case 'SAVE_CHILD_REPLAY_STEPS': {
       // Store steps + expected final URL so FORM_READY can skip intermediate redirect pages
-      watch.pendingChildReplaySteps = { steps: message.steps, expectedUrl: message.expectedUrl || '' };
+      watch.pendingChildReplaySteps = { steps: message.steps, apiRecordings: message.apiRecordings || [], expectedUrl: message.expectedUrl || '' };
       return { ok: true };
     }
 
@@ -190,9 +191,9 @@ async function handleMessage(message, sender) {
       // The tab is opened directly at the customer form URL (via API hook), so there
       // are no intermediate redirect pages to skip. Deliver steps immediately.
       if (childReplayStore[sender.tab.id]) {
-        const { steps } = childReplayStore[sender.tab.id];
+        const { steps, apiRecordings } = childReplayStore[sender.tab.id];
         delete childReplayStore[sender.tab.id];
-        return { isChildTabReplay: true, steps };
+        return { isChildTabReplay: true, steps, apiRecordings: apiRecordings || [] };
       }
 
       const state = await getResumeState(sender.tab.id);

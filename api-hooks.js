@@ -26,3 +26,14 @@ var API_HOOKS = [
     },
   },
 ];
+
+// ─── API Virtualization Patterns ──────────────────────────────────────────────
+// API responses whose URLs match these patterns will be captured during
+// recording and replayed during step replay (when virtualization is enabled).
+// Uses the same urlPattern substring-match convention as API_HOOKS.
+// Add one entry per API whose responses should be recorded and virtualized.
+// var (not const/let) so it lands on window and is visible to api-tab-opener-main.js.
+// eslint-disable-next-line no-unused-vars
+var VIRTUAL_APIS = [
+  { urlPattern: '/api/sendnotification.json' },
+];
