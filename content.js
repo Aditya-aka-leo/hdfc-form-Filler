@@ -657,7 +657,12 @@ function waitForFillable(name) {
     let lastLog = 0;
     const id = setInterval(() => {
       if (!stepReplayActive) { clearInterval(id); return resolve(null); }
-      const el = document.querySelector(selector);
+      // Use querySelectorAll and prefer the first visible instance.
+      // AEM sometimes has multiple elements with the same name (e.g. hidden accordion
+      // duplicates) — querySelector always returns the first, which may be inside a
+      // display:none ancestor while the actually visible instance is later in the DOM.
+      const all = Array.from(document.querySelectorAll(selector));
+      const el = all.find(e => !isHidden(e)) || all[0] || null;
       const elapsed = Date.now() - start;
       if (el) {
         if (!isHidden(el)) {
