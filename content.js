@@ -630,7 +630,11 @@ function waitForFillable(name) {
     let lastLog = 0;
     const id = setInterval(() => {
       if (!stepReplayActive) { clearInterval(id); return resolve(null); }
-      const el = document.querySelector(selector);
+      // Use querySelectorAll and prefer the first visible instance.
+      // AEM accordion sections duplicate field names; querySelector returns the first
+      // (often hidden) copy — querySelectorAll lets us find the visible one.
+      const all = Array.from(document.querySelectorAll(selector));
+      const el = all.find(e => !isHidden(e)) || all[0] || null;
       const elapsed = Date.now() - start;
       if (el) {
         if (!isHidden(el)) {
