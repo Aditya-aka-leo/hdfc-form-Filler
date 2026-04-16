@@ -177,6 +177,41 @@ function handleInputChange(e) {
 // and always accessible from content scripts — no extension API needed.
 // The Perfios page (different origin) cannot read or modify it.
 const LS_KEY = '__hdfc_ext_recording__';
+
+// sessionStorage flag written before any same-tab navigation while recording.
+// Each tab has its own sessionStorage (not shared between tabs), so this never
+// leaks to child tabs even when they share the same origin.
+// The next page reads-and-clears this flag to know it should preserve localStorage
+// rather than delete it (which is the behaviour for a fresh / non-recording page).
+const SS_RECORDING_ACTIVE_KEY = '__hdfc_ext_rec_active__';
+
+/**
+ * Returns true if sessionStorage shows this tab was actively recording when it
+ * navigated away.  Reads AND clears the flag — it is valid for exactly one page
+ * transition so the next fresh page-load is not incorrectly treated as a
+ * recording continuation.
+ */
+function checkRecordingActiveContinuation() {
+  try {
+    const raw = window.sessionStorage.getItem(SS_RECORDING_ACTIVE_KEY);
+    if (!raw) {
+      log.info('recording continuation check: sessionStorage flag NOT set → treating as fresh page');
+      return false;
+    }
+    window.sessionStorage.removeItem(SS_RECORDING_ACTIVE_KEY);
+    const { savedAt } = JSON.parse(raw);
+    const ageMs = Date.now() - savedAt;
+    if (ageMs >= 10 * 60 * 1000) {
+      log.info(`recording continuation check: sessionStorage flag found but stale (${Math.round(ageMs/1000)}s old) → treating as fresh`);
+      return false;
+    }
+    log.info(`recording continuation check: ✅ flag found (${Math.round(ageMs/1000)}s old) → redirect continuation, will preserve localStorage`);
+    return true;
+  } catch {
+    log.warn('recording continuation check: error reading sessionStorage');
+    return false;
+  }
+}
 function persistRecordingState() {
   if (stepReplayActive) return; // don't overwrite during replay
   try {
@@ -186,17 +221,22 @@ function persistRecordingState() {
       pathname: window.location.origin + window.location.pathname,
       savedAt:  Date.now(),
     }));
-  } catch { /* storage full or unavailable — ignore */ }
+    log.info(`persist: localStorage saved — ${recordedSteps.length} step(s), ${Object.keys(recordedData).length} field(s)`,
+      `| isChildRecordingTab: ${isChildRecordingTab}`);
+  } catch (e) {
+    log.warn('persist: localStorage write failed —', e);
+  }
 
   // If this is a child recording tab, push the latest steps to background after every step.
   // Background immediately forwards them to the parent RM tab so it stays up-to-date
   // without depending on tab switching or closing events.
   if (isChildRecordingTab) {
+    log.info(`persist: CHILD_STEP_RECORDED → sending ${recordedSteps.length} step(s) to background`);
     chrome.runtime.sendMessage({
       type:  'CHILD_STEP_RECORDED',
       steps: [...recordedSteps],
       url:   window.location.href,
-    }).catch(() => {});
+    }).catch(err => log.warn('persist: CHILD_STEP_RECORDED send failed —', err));
   }
 }
 
@@ -207,15 +247,21 @@ chrome.storage.local.get('allowedPatterns').then(async ({ allowedPatterns }) => 
   if (allowedPatterns && allowedPatterns.length > 0) {
     const href = window.location.href;
     const allowed = allowedPatterns.some(p => href.startsWith(p.replace(/\*$/, '')));
+    log.info(`activation guard: URL pattern check — allowed: ${allowed}, url: ${href}`);
     if (!allowed) {
       // URL doesn't match — but check if background flagged this as a child tab
       // (recording or replay). If so, activate anyway regardless of URL filter.
       const check = await chrome.runtime.sendMessage({ type: 'IS_CHILD_TAB' }).catch(() => ({}));
+      log.info('activation guard: IS_CHILD_TAB response —', JSON.stringify({
+        isChildTab:       check.isChildTab,
+        isChildTabReplay: check.isChildTabReplay,
+        url:              window.location.href,
+      }));
       if (!check.isChildTab && !check.isChildTabReplay) {
-        log.info('Skipping — page not in allowed URL list');
+        log.info('activation guard: ⛔ skipping — URL not in allowed list and not a child tab');
         return;
       }
-      log.info('Child tab detected — activating despite URL filter');
+      log.info('activation guard: ✅ child tab detected — activating despite URL filter');
     }
   }
   activate();
@@ -224,21 +270,26 @@ chrome.storage.local.get('allowedPatterns').then(async ({ allowedPatterns }) => 
 // Synchronously restore recording state BEFORE activating listeners
 // This prevents form change events from firing before old steps are restored
 function restoreRecordingStateSync() {
+  const navType = performance.getEntriesByType('navigation')[0]?.type || 'unknown';
+  log.info(`recording restore: checking localStorage — navType: ${navType}, url: ${window.location.href}`);
   try {
     const raw = window.localStorage.getItem(LS_KEY);
-    if (!raw) return;
-    // On a hard reload, clear saved state — only restore on redirect/navigation
-    const navType = performance.getEntriesByType('navigation')[0]?.type;
-    if (navType === 'reload') {
-      window.localStorage.removeItem(LS_KEY);
-      log.info('recording restore: page reloaded — cleared state');
+    if (!raw) {
+      log.info('recording restore: localStorage empty — nothing to restore');
       return;
     }
-    const { data, steps, savedAt } = JSON.parse(raw);
-    const expired = Date.now() - savedAt > 2 * 60 * 60 * 1000; // 2 hours
-    if (expired) {
+    // On a hard reload, clear saved state — only restore on redirect/navigation
+    if (navType === 'reload') {
       window.localStorage.removeItem(LS_KEY);
-      log.info('recording restore: state expired — cleared');
+      log.info('recording restore: page reloaded — cleared localStorage state');
+      return;
+    }
+    const { data, steps, pathname, savedAt } = JSON.parse(raw);
+    const ageMs = Date.now() - savedAt;
+    log.info(`recording restore: found localStorage state — ${steps?.length ?? 0} step(s), ${Object.keys(data || {}).length} field(s), saved from: ${pathname}, age: ${Math.round(ageMs/1000)}s`);
+    if (ageMs > 2 * 60 * 60 * 1000) {
+      window.localStorage.removeItem(LS_KEY);
+      log.info('recording restore: state expired (>2h) — cleared');
       return;
     }
     // Restore steps BEFORE listeners are attached
@@ -249,7 +300,9 @@ function restoreRecordingStateSync() {
       for (const step of steps) {
         if (step.type === 'fill') lastRecordedFillValue.set(step.name, step.value);
       }
-      log.info(`recording restore: ✅ restored — ${Object.keys(data).length} field(s), ${steps.length} step(s) (before listeners attached)`);
+      log.info(`recording restore: ✅ restored ${steps.length} step(s) into memory (${Object.keys(data).length} fields) — listeners not yet attached`);
+    } else {
+      log.info(`recording restore: recordedSteps already has ${recordedSteps.length} step(s) — skipping restore`);
     }
   } catch (e) {
     log.warn('recording restore: error reading localStorage —', e);
@@ -269,7 +322,20 @@ restoreRecordingStateSync();
 // Only restore recording state if this is an actual redirect flow.
 let isRedirectFlow = false;
 
+log.info('activate: FORM_READY sent — waiting for background response');
 chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
+  log.info('activate: FORM_READY response —', JSON.stringify({
+    isChildTab:      response?.isChildTab,
+    isChildTabReplay: response?.isChildTabReplay,
+    resume:          response?.resume,
+    pendingState:    response?.pendingState,
+    resumeFromStep:  response?.resumeFromStep,
+    totalSteps:      response?.steps?.length,
+    stopAfterIndex:  response?.stopAfterIndex,
+    accumulatedSteps: response?.accumulatedSteps?.length,
+    expectedPath:    response?.expectedPath,
+  }));
+
   // ── Child tab in RECORDING mode ──────────────────────────────────────────
   // Background detected this tab was opened by a watched click during recording.
   // Set the flag so persistRecordingState() forwards every step to the parent RM tab
@@ -282,9 +348,9 @@ chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
     // background returns the steps accumulated by previous pages so they carry forward.
     if (response.accumulatedSteps?.length > 0) {
       recordedSteps.push(...response.accumulatedSteps);
-      log.info(`activate: child recording tab — restored ${response.accumulatedSteps.length} step(s) from previous page in this child tab`);
+      log.info(`activate: ✅ child RECORDING tab — restored ${response.accumulatedSteps.length} accumulated step(s) from previous page(s) in this child tab`);
     } else {
-      log.info('activate: child recording tab — starting fresh, will push each step to parent RM tab in real-time');
+      log.info('activate: ✅ child RECORDING tab — starting fresh, will push each step to parent RM tab in real-time');
     }
     isChildRecordingTab = true;
     return;
@@ -294,7 +360,7 @@ chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
   // Background has steps queued for this tab to replay.
   // After all steps complete, signal background → RM form auto-continues its replay.
   if (response?.isChildTabReplay) {
-    log.info(`activate: child replay tab — replaying ${response.steps.length} step(s)`);
+    log.info(`activate: ✅ child REPLAY tab — replaying ${response.steps.length} step(s)`);
     // Clear any RM form state restored from shared localStorage (same origin = same storage).
     recordedSteps.length = 0;
     Object.keys(recordedData).forEach(k => delete recordedData[k]);
@@ -308,7 +374,7 @@ chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
       const result = await replaySteps(response.steps, -1);
       if (!result?.suspended) {
         // All steps on this page completed — child tab replay fully done.
-        log.info('activate: child replay complete — signaling parent RM tab to continue');
+        log.info('activate: child replay complete — sending CHILD_REPLAY_DONE to background');
         await chrome.runtime.sendMessage({ type: 'CHILD_REPLAY_DONE' }).catch(() => {});
       } else {
         // Mid-replay navigation detected — next page will resume via FORM_READY and
@@ -325,12 +391,20 @@ chrome.runtime.sendMessage({ type: 'FORM_READY' }).then(async (response) => {
   if (!response?.resume) {
     if (response?.pendingState) {
       isRedirectFlow = true; // We're in the middle of a redirect flow
-      log.info(`replay restore: ⏸ pending state found but still on intermediate domain — waiting to resume at ${response.expectedPath}`);
+      log.info(`activate: ⏸ intermediate page (Perfios/other) — replay state preserved, waiting to resume at origin: ${response.expectedPath}`);
     } else {
-      // No redirect flow — clear any stale recording state
       if (!isRedirectFlow) {
-        log.info('replay restore: no pending state for this page');
-        window.localStorage.removeItem(LS_KEY);
+        // Only wipe the recording state if this is NOT a recording redirect continuation.
+        // checkRecordingActiveContinuation() reads + clears the sessionStorage flag written
+        // by markRedirect / the global beforeunload listener before each navigation.
+        const isRecordingContinuation = checkRecordingActiveContinuation();
+        if (isRecordingContinuation) {
+          log.info(`activate: ✅ recording redirect continuation — localStorage preserved (${recordedSteps.length} step(s) in memory)`);
+        } else {
+          log.info(`activate: no active session on this page — clearing this origin's localStorage`
+            + (recordedSteps.length ? ` (discarding ${recordedSteps.length} stale step(s) from a previous session on this origin — NOT your current recording)` : ''));
+          window.localStorage.removeItem(LS_KEY);
+        }
       }
     }
     return;
@@ -468,18 +542,27 @@ function handleStepClick(e) {
   const markRedirect = () => {
     pendingMarkRedirect = null;
     if (recordedSteps[redirectStepIndex]?.type === 'click') {
-      // Distinguish reload (same URL) vs redirect (different URL)
-      const isReload = window.location.pathname === originalUrl;
-      recordedSteps[redirectStepIndex].expectsRedirect = !isReload;
-      if (isReload) {
-        recordedSteps[redirectStepIndex].expectsReload = true;
-        // Clear recording state from localStorage before reload to suppress restore logs
-        window.localStorage.removeItem(LS_KEY);
-        log.info('recorded reload: clearing recording state from localStorage');
-      }
+      // A click caused beforeunload — always treat as expectsRedirect=true.
+      //
+      // WHY: at beforeunload time the browser has NOT navigated yet, so
+      // window.location.pathname is still the original URL regardless of whether
+      // this is a same-URL reload or a cross-origin redirect.  Comparing it to
+      // originalUrl therefore always returns "same" and falsely classifies every
+      // redirect as a reload — wiping localStorage and losing all recorded steps.
+      //
+      // The old reload detection (localStorage.removeItem) is unnecessary here:
+      // • Hard reloads (Ctrl+R / F5) never reach this function because handleStepClick
+      //   is not involved — no markRedirect listener is ever registered.
+      // • If a button explicitly calls location.reload(), restoreRecordingStateSync()
+      //   on the next load sees navType==='reload' and clears localStorage there.
+      recordedSteps[redirectStepIndex].expectsRedirect = true;
+      try {
+        window.sessionStorage.setItem(SS_RECORDING_ACTIVE_KEY, JSON.stringify({ savedAt: Date.now() }));
+      } catch {}
+      log.info(`recorded REDIRECT: step ${redirectStepIndex + 1} — beforeunload fired | from: ${originalUrl}`,
+        `| expectsRedirect=true set | SS_RECORDING_ACTIVE_KEY written → next page will preserve recording state`);
       persistRecordingState();
-      const navType = isReload ? 'reload' : 'redirect';
-      log.info(`recorded ${navType}: step ${redirectStepIndex + 1} marked as expects${isReload ? 'Reload' : 'Redirect'}=true`);
+      log.info(`recorded nav: step ${redirectStepIndex + 1} persisted | total steps now: ${recordedSteps.length}`);
     }
   };
   pendingMarkRedirect = markRedirect;
@@ -493,13 +576,53 @@ function handleStepClick(e) {
 document.addEventListener('change', handleStepChange, true);
 document.addEventListener('click', handleStepClick, true);
 
+// Safety net: catch ALL navigations (auto-redirects, JS location.href changes, etc.)
+// that bypass handleStepClick entirely.  If we have recorded steps and are not in
+// replay mode, write the sessionStorage recording-active flag so the next page knows
+// to preserve localStorage rather than wipe it.  Also force-persist the latest state
+// so nothing is lost even if no input event fires before unload.
+window.addEventListener('beforeunload', () => {
+  if (stepReplayActive) return;      // don't interfere with replay flow
+  if (isChildRecordingTab) {
+    // Child recording tab is navigating/closing.
+    // Real-time CHILD_STEP_RECORDED messages already kept the parent in sync — this
+    // is a safety-net final save in case the tab closes before a last step was forwarded.
+    if (recordedSteps.length > 0) {
+      log.info(`global beforeunload (child tab): 🔒 sending SAVE_CHILD_STEPS safety-net — ${recordedSteps.length} step(s), url: ${window.location.href}`);
+      chrome.runtime.sendMessage({
+        type:  'SAVE_CHILD_STEPS',
+        steps: [...recordedSteps],
+        url:   window.location.href,
+      }).catch(() => {});
+    } else {
+      log.info('global beforeunload (child tab): no recorded steps — nothing to save');
+    }
+    return;
+  }
+  if (recordedSteps.length === 0) {
+    log.info('global beforeunload: no recorded steps — nothing to preserve');
+    return;
+  }
+  log.info(`global beforeunload: ✅ recording active (${recordedSteps.length} step(s)) — writing SS_RECORDING_ACTIVE_KEY + persisting to localStorage`);
+  try {
+    window.sessionStorage.setItem(SS_RECORDING_ACTIVE_KEY, JSON.stringify({ savedAt: Date.now() }));
+  } catch {}
+  persistRecordingState();
+}, { capture: true }); // capture=true so we run before any page-script beforeunload handlers
+
 // ── Child tab steps → embed into parent click step (recording) ──────────────
 // Background forwards child steps to the parent RM tab after each recorded step
 // (CHILD_STEP_RECORDED) and also when the child tab actually closes (tab lifecycle).
 // Both paths arrive here as RESUME_AFTER_TAB_CLOSE — just overwrite each time.
 chrome.runtime.onMessage.addListener((message) => {
-  if (message.type !== 'RESUME_AFTER_TAB_CLOSE' || stepReplayActive) return;
-  if (!message.childTabSteps?.length) return;
+  if (message.type !== 'RESUME_AFTER_TAB_CLOSE') return;
+  log.info(`RESUME_AFTER_TAB_CLOSE received — childTabSteps: ${message.childTabSteps?.length ?? 0}, url: ${message.childTabUrl || '(none)'}`,
+    `| stepReplayActive: ${stepReplayActive}`);
+  if (stepReplayActive) return;
+  if (!message.childTabSteps?.length) {
+    log.info('RESUME_AFTER_TAB_CLOSE: no child steps — nothing to embed');
+    return;
+  }
   // Find the most recent click step marked opensNewTab=true (the one that opened this child)
   let lastChildClickIdx = -1;
   for (let i = recordedSteps.length - 1; i >= 0; i--) {
@@ -512,7 +635,9 @@ chrome.runtime.onMessage.addListener((message) => {
     recordedSteps[lastChildClickIdx].childTabSteps = message.childTabSteps;
     recordedSteps[lastChildClickIdx].childTabUrl   = message.childTabUrl;
     persistRecordingState();
-    log.info(`recorded child tab: embedded ${message.childTabSteps.length} step(s) into click step ${lastChildClickIdx + 1} (url: ${message.childTabUrl})`);
+    log.info(`✅ child tab steps embedded: ${message.childTabSteps.length} step(s) → click step ${lastChildClickIdx + 1} (url: ${message.childTabUrl})`);
+  } else {
+    log.warn('RESUME_AFTER_TAB_CLOSE: could not find a click step with opensNewTab=true to embed child steps into');
   }
 });
 
@@ -801,7 +926,8 @@ async function replaySteps(steps, stopAfterIndex = -1) {
   // SAVE_RESUME_STATE is saved before each click so FORM_READY can resume after the redirect.
   let suspendedForNavigation = false;
   const onNavigate = () => {
-    log.info('replaySteps: beforeunload — page navigating, suspending replay');
+    log.info(`replaySteps: ⚡ beforeunload fired — page navigating away from ${window.location.pathname}, suspending replay`,
+      `| FORM_READY on next page will resume from saved state`);
     stepReplayActive = false;
     suspendedForNavigation = true;
   };
@@ -824,8 +950,9 @@ async function replaySteps(steps, stopAfterIndex = -1) {
     if (!stepReplayActive) { log.info('replaySteps: navigation detected — suspending'); break; }
 
     // We're executing step i — the previous step did NOT cause page navigation.
-    // Safe to clear any resume state that was saved for the previous click.
+    // Safe to clear any resume state that was saved for the previous step.
     await chrome.runtime.sendMessage({ type: 'CLEAR_RESUME_STATE' }).catch(() => {});
+    log.info(`replay: CLEAR_RESUME_STATE sent (previous step completed without navigation)`);
 
     log.group(`Step ${i + 1}/${steps.length}: ${step.type} — ${step.name || step.text || ''}`);
 
@@ -844,6 +971,20 @@ async function replaySteps(steps, stopAfterIndex = -1) {
         log.info(`fill: skipping empty select value for "${step.name}"`); log.end(); continue;
       }
       log.info(`fill: [${step.name}] type=${type} value="${step.value}"`);
+
+      // Save resume state before executing the fill so that if this field triggers a
+      // same-tab page redirect (e.g. auto-navigation after an API-dependent field change),
+      // FORM_READY can resume replay from the next step on the new page.
+      await chrome.runtime.sendMessage({
+        type:             'SAVE_RESUME_STATE',
+        steps,
+        resumeFromStep:   i + 1,
+        stopAfterIndex,
+        expectedPath:     window.location.origin + window.location.pathname,
+        isChildTabReplay: isChildReplayTab,
+      }).catch(() => {});
+      log.info(`replay: ⏳ SAVE_RESUME_STATE before FILL step ${i + 1}/${steps.length}`,
+        `— field: "${step.name}", resumeFromStep: ${i + 2}, expectedPath: ${window.location.pathname}`);
 
       if (type === 'radio') {
         const radio = document.querySelector(`[name="${CSS.escape(step.name)}"][value="${CSS.escape(String(step.value))}"]`);
@@ -963,8 +1104,9 @@ async function replaySteps(steps, stopAfterIndex = -1) {
           stopAfterIndex,
           expectedPath: window.location.origin + window.location.pathname,
           isChildTabReplay: isChildReplayTab, // carry flag so next page knows it's still a child replay
-        });
-        log.info(`replay save: ⏳ saved state before click — will resume from step ${i + 2}/${steps.length} if page navigates (expectedPath=${window.location.pathname})`);
+        }).catch(err => log.warn(`replay: SAVE_RESUME_STATE failed for CLICK step ${i + 1} —`, err));
+        log.info(`replay: ⏳ SAVE_RESUME_STATE before CLICK step ${i + 1}/${steps.length}`,
+          `— resumeFromStep: ${i + 2}, expectedPath: ${window.location.pathname}, isChildTabReplay: ${isChildReplayTab}`);
 
         // If this click is expected to open a child tab, always queue child replay steps
         // (even if empty) so IS_CHILD_TAB returns isChildTabReplay:true and the URL filter
@@ -986,7 +1128,10 @@ async function replaySteps(steps, stopAfterIndex = -1) {
           // Fire once and wait for beforeunload — no need to guess from "button gone" heuristics.
           // SAVE_RESUME_STATE is already saved; FORM_READY will resume after the redirect.
           log.info('click: expectsRedirect=true — firing and waiting for page navigation (up to 30s)');
-          await chrome.runtime.sendMessage({ type: 'START_WATCHING_TAB' });
+          // Don't send START/STOP_WATCHING_TAB from child replay tabs — the parent RM tab already
+          // controls the watch state (childTabId → parentTabId). Overwriting it from here would
+          // wipe the parent's resumeTabId, breaking CHILD_REPLAY_DONE forwarding.
+          if (!isChildReplayTab) await chrome.runtime.sendMessage({ type: 'START_WATCHING_TAB' }).catch(() => {});
           el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
           el.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true, cancelable: true, view: window }));
           el.dispatchEvent(new MouseEvent('click',     { bubbles: true, cancelable: true, view: window }));
@@ -1006,7 +1151,7 @@ async function replaySteps(steps, stopAfterIndex = -1) {
             log.warn('click: navigation expected but did not happen after 30s — continuing normally');
           }
           clicked = true;
-          await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' });
+          if (!isChildReplayTab) await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' }).catch(() => {});
         } else if (step.opensNewTab) {
           // Child replay steps were already queued via SAVE_CHILD_REPLAY_STEPS above.
           // Fire the click once (triggers the API call) and move on immediately —
@@ -1014,7 +1159,7 @@ async function replaySteps(steps, stopAfterIndex = -1) {
           // The next RM step's waitForFillable/waitForClickable naturally waits
           // until the RM form is ready (e.g. button enabled after customer sync).
           log.info('click: opensNewTab=true — firing once, child tab will auto-replay in background');
-          await chrome.runtime.sendMessage({ type: 'START_WATCHING_TAB' });
+          if (!isChildReplayTab) await chrome.runtime.sendMessage({ type: 'START_WATCHING_TAB' }).catch(() => {});
           el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
           el.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true, cancelable: true, view: window }));
           el.dispatchEvent(new MouseEvent('click',     { bubbles: true, cancelable: true, view: window }));
@@ -1025,9 +1170,12 @@ async function replaySteps(steps, stopAfterIndex = -1) {
 
         while (stepReplayActive && !clicked) {
           log.info('click: firing on', el);
-          await chrome.runtime.sendMessage({ type: 'START_WATCHING_TAB' });
-          // Register listener BEFORE the click fires so we never miss a fast tab open+close
-          const tabClosePromise = waitForTabClose();
+          // Don't send START_WATCHING_TAB from child replay tabs — it would overwrite
+          // the parent RM tab's resumeTabId in the shared watch state.
+          if (!isChildReplayTab) await chrome.runtime.sendMessage({ type: 'START_WATCHING_TAB' }).catch(() => {});
+          // Register new-tab listener BEFORE the click so we never miss a fast open+close.
+          // For child replay tabs, no new tab is expected — skip to save message overhead.
+          const tabClosePromise = isChildReplayTab ? Promise.resolve() : waitForTabClose();
 
           el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
           el.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true, cancelable: true, view: window }));
@@ -1037,7 +1185,9 @@ async function replaySteps(steps, stopAfterIndex = -1) {
           // Wait to see if navigation/new-tab happened
           await new Promise(r => setTimeout(r, 1500));
 
-          const { watchedTabId } = await chrome.runtime.sendMessage({ type: 'GET_WATCH_STATE' });
+          // For child replay tabs, skip new-tab detection entirely — no child-of-child scenario.
+          const watchedTabId = isChildReplayTab ? null
+            : (await chrome.runtime.sendMessage({ type: 'GET_WATCH_STATE' }).catch(() => ({}))).watchedTabId;
           if (watchedTabId) {
             log.info(`click: new tab detected (${watchedTabId}), waiting for close`);
             clicked = true;
@@ -1054,14 +1204,14 @@ async function replaySteps(steps, stopAfterIndex = -1) {
               // Button gone or now disabled — navigation happened or form moved on
               log.info('click: button gone/disabled after click, assuming success');
               clicked = true;
-              await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' });
+              if (!isChildReplayTab) await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' }).catch(() => {});
               await new Promise(r => setTimeout(r, 200));
             } else if (isHidden(stillHere)) {
               // Button is now hidden (display:none / visibility:hidden) — click had its effect
               // (e.g. "Go to Bottom" scroll helper hides itself, modal close hides the trigger, etc.)
               log.info('click: button hidden after click — treating as success');
               clicked = true;
-              await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' });
+              if (!isChildReplayTab) await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' }).catch(() => {});
             } else {
               // Look ahead: if the next step's target is now visible on screen, the click
               // opened a modal/overlay even though this button is still present (e.g. eVerifyButton).
@@ -1076,7 +1226,7 @@ async function replaySteps(steps, stopAfterIndex = -1) {
               if (nextVisible) {
                 log.info('click: next step element is now visible — assuming modal/overlay opened, moving on');
                 clicked = true;
-                await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' });
+                if (!isChildReplayTab) await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' }).catch(() => {});
                 await new Promise(r => setTimeout(r, 300));
               } else {
                 // Button still visible and enabled — click once and move on.
@@ -1084,7 +1234,7 @@ async function replaySteps(steps, stopAfterIndex = -1) {
                 // side-effects (API calls, panel opening) to complete.
                 log.info('click: button still present after click — clicked once, moving on');
                 clicked = true;
-                await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' });
+                if (!isChildReplayTab) await chrome.runtime.sendMessage({ type: 'STOP_WATCHING_TAB' }).catch(() => {});
                 await new Promise(r => setTimeout(r, 300));
               }
             }
@@ -1155,6 +1305,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     case 'STOP_STEP_REPLAY': {
       stepReplayActive = false;
       document.documentElement.removeAttribute('data-hdfc-replay');
+      // Clear any pending resume state saved before the last click — prevents ghost
+      // pendingState:true appearing in future recording sessions on the same tab.
+      chrome.runtime.sendMessage({ type: 'CLEAR_RESUME_STATE' }).catch(() => {});
+      log.info('STOP_STEP_REPLAY: stepReplayActive=false, CLEAR_RESUME_STATE sent to background');
       sendResponse({ ok: true });
       break;
     }
