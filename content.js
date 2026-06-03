@@ -460,7 +460,13 @@ function handleStepChange(e) {
   const label = (type === 'select-one' && input.selectedIndex >= 0)
     ? (input.options[input.selectedIndex]?.text || '')
     : undefined;
-  
+
+  // For radio buttons, record the group index so replay can find the right button
+  // even when value="" (common in AEM adaptive forms where radios have no value attribute)
+  const radioIndex = type === 'radio'
+    ? Array.from(document.querySelectorAll(`input[type="radio"][name="${CSS.escape(name)}"]`)).indexOf(input)
+    : undefined;
+
   // Deduplicate: skip if this field was last recorded with the same value
   // (catches AEM re-firing change events on already-filled fields after section re-renders,
   //  even when other fields were recorded in between)
@@ -470,8 +476,13 @@ function handleStepChange(e) {
   }
   lastRecordedFillValue.set(name, value);
 
-  recordedSteps.push({ type: 'fill', name, value, inputType: type, ...(label !== undefined && { label }) });
-  log.info('recorded fill:', name, '=', value, label ? `(label: ${label})` : '');
+  recordedSteps.push({ type: 'fill', name, value, inputType: type,
+    ...(label !== undefined && { label }),
+    ...(radioIndex !== undefined && radioIndex >= 0 && { radioIndex }),
+  });
+  log.info('recorded fill:', name, '=', value,
+    label ? `(label: ${label})` : '',
+    radioIndex !== undefined && radioIndex >= 0 ? `(radioIndex: ${radioIndex})` : '');
   persistRecordingState();
 }
 
@@ -987,7 +998,15 @@ async function replaySteps(steps, stopAfterIndex = -1) {
         `— field: "${step.name}", resumeFromStep: ${i + 2}, expectedPath: ${window.location.pathname}`);
 
       if (type === 'radio') {
-        const radio = document.querySelector(`[name="${CSS.escape(step.name)}"][value="${CSS.escape(String(step.value))}"]`);
+        // Try value-based selector first; fall back to recorded group index for value="" cases
+        let radio = (step.value !== '' && step.value !== null && step.value !== undefined)
+          ? document.querySelector(`[name="${CSS.escape(step.name)}"][value="${CSS.escape(String(step.value))}"]`)
+          : null;
+        if (!radio && step.radioIndex >= 0) {
+          const allRadios = Array.from(document.querySelectorAll(`input[type="radio"][name="${CSS.escape(step.name)}"]`));
+          radio = allRadios[step.radioIndex] || null;
+          if (radio) log.info(`fill: radio index fallback — using index ${step.radioIndex}`);
+        }
         if (radio && !radio.checked) {
           const clickTarget = radio.labels?.[0] || radio.closest('label') || radio.parentElement || radio;
           clickTarget.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
